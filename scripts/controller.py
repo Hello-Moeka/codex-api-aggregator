@@ -184,17 +184,20 @@ def probe_stream(model):
     try:
         with urlopen(request,timeout=120) as response:
             for line in response:
-                if not line.startswith(b'data: '):continue
-                try:item=json.loads(line[6:])
+                if not line.startswith(b'data:'):continue
+                try:item=json.loads(line[5:].strip())
                 except ValueError:continue
+                if not isinstance(item,dict):continue
                 if item.get('type')=='response.output_text.delta':text+=item.get('delta','')
-                if item.get('type')=='response.completed':completed=True
+                if item.get('type')=='response.completed':completed=True;break
         result={'passed':completed and 'GATEWAY_OK' in text,'http':200,'completed':completed}
     except HTTPError as error:
         result={'passed':False,'http':error.code}
         try:
             payload=json.loads(error.read()).get('error',{})
             code=payload.get('code') or payload.get('type')
+            if payload.get('attempted') is False:
+                result.update(skipped=True,error='未执行：被当前熔断或额度规则拦截，可点击检查恢复')
             messages={'get_channel_failed':'该令牌分组没有此模型的可用渠道',
                       'model_unavailable':'该模型暂无渠道或未被此来源提供',
                       'permission_denied':'此来源没有该模型的使用权限',
@@ -210,7 +213,7 @@ def probe_stream(model):
                       'upstream_unavailable':'上游服务暂时不可用',
                       'invalid_api_key':'上游凭据无效',
                       'insufficient_quota':'上游额度不足'}
-            if code in messages:result['error']=messages[code]
+            if code in messages and not result.get('skipped'):result['error']=messages[code]
             if code=='model_not_found':result['error']='该来源模型当前无可用路由'
             if 'auth_unavailable' in str(payload.get('message','')):result['error']='该来源当前无可用凭据（可能处于冷却）'
         except Exception:pass
@@ -237,7 +240,7 @@ def run_test(source,model):
     if model not in allowed:raise ValueError('该来源没有配置此模型')
     result=probe(source['id']+'/'+model)
     with LOCK:TESTS[source['id']]=result;save(DATA/'provider-tests.json',TESTS)
-    event(source['name']+'：请求测试'+('通过' if result['passed'] else '失败'))
+    event(source['name']+'：请求测试'+('未执行' if result.get('skipped') else '通过' if result['passed'] else '失败'))
 
 def batch_summary():
     rows=BATCH.get('results',[])
@@ -264,7 +267,7 @@ def run_batch(model):
         except Exception as error:result={'passed':False,'error':type(error).__name__,'model':source['id']+'/'+model,'checked_at':now(),'seconds':0}
         with LOCK:
             TESTS[source['id']]=result;save(DATA/'provider-tests.json',TESTS)
-            row.update(result,status='passed' if result['passed'] else 'failed');batch_summary()
+            row.update(result,status='skipped' if result.get('skipped') else 'passed' if result['passed'] else 'failed');batch_summary()
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:list(pool.map(test_one,sources))
     finally:

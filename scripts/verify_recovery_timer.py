@@ -50,13 +50,22 @@ async def main():
                 item = router.state.get('a')
                 assert item['state'] == 'open' and item['until'] > time.time() and not item['probe_in_progress']
                 assert item['probe_finished_at'] >= item['probe_started_at']
+                assert item['last_probe']['passed'] is False and item['last_probe']['model'] == 'test'
+                assert item['last_probe']['reason'] == 'upstream_error'
                 checks.append('failed recovery stays open and schedules a new future cooldown')
                 count = len(hits); await router.check('a'); assert len(hits) == count
                 checks.append('future cooldown does not send an early probe')
                 mode[0] = 'success'; item['until'] = 0; await router.check('a')
                 assert item['state'] == 'half_open'
+                assert item['last_probe']['passed'] is True and item['last_probe']['reason'] == 'success'
                 item['until'] = 0; await router.check('a'); assert item['state'] == 'closed' and item['until'] == 0
                 checks.append('two successful recovery probes close the breaker and clear cooldown')
+                count=len(hits)
+                await router.check('a'); assert len(hits)==count
+                item['reclaim_after']=time.time()-1
+                await router.check('a')
+                assert len(hits)==count+1 and item['reclaim_verified']
+                checks.append('stable observation waits then verifies with an extra real probe')
                 item.update(state='closed', consecutive=1, reason='upstream_error', probe_model='test')
                 count = len(hits); await router.check('a', manual=True)
                 assert len(hits) == count + 1

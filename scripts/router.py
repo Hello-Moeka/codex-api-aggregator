@@ -58,7 +58,8 @@ def reserve_status(policy, windows):
 
 def retry_after(value):
     try:
-        return max(1, float(value))
+        seconds=float(value)
+        return max(1,seconds) if math.isfinite(seconds) else 60
     except (TypeError, ValueError):
         try:
             return max(1, email.utils.parsedate_to_datetime(value).timestamp() - time.time())
@@ -70,6 +71,13 @@ class Failure(Exception):
     def __init__(self, kind, status=502, delay=0, reset=0):
         super().__init__(kind)
         self.kind, self.status, self.delay, self.reset = kind, status, delay, reset
+
+
+class ProbeSink:
+    """Validate exactly the business stream without sending it to a client."""
+    async def prepare(self, request): pass
+    async def write(self, data): pass
+    async def write_eof(self): pass
 
 
 def classify(status, payload, headers=None, official=False):
@@ -85,6 +93,7 @@ def classify(status, payload, headers=None, official=False):
         reset = error.get('resets_at') or error.get('reset_at') or 0
         try:
             reset = float(reset)
+            if not math.isfinite(reset): reset=0
             if reset > 1e12: reset /= 1000
         except (ValueError, TypeError): reset = 0
         return Failure('quota_wait' if official else 'balance_wait', 429 if official else 403, reset=reset)
@@ -138,6 +147,7 @@ class State:
             state = item.get('state', 'closed')
             if state in ('quota_wait', 'balance_wait', 'auth_required'):
                 return None, state
+            if item.get('quota_blocked'): return None, 'quota_wait'
             if item.get('reserve_enabled'):
                 if item.get('reserve_blocked'): return None, 'reserve_wait'
                 if not item.get('reserve_known') or item.get('query_error'): return None, 'reserve_unknown'
@@ -151,20 +161,23 @@ class State:
     def release(self, permits):
         self.active.difference_update(permits or [])
 
-    def success(self, ident, model, permits=()):
+    def success(self, ident, model, permits=(), versions=None):
         for key in (ident, self.key(ident, model)):
             item = self.items.setdefault(key, {})
+            if versions is not None and item.get('revision',0)!=versions.get(key,0): continue
             self.history[key].append(False)
             item['consecutive'] = 0
             item['last_success_at'] = stamp()
             # A model success only clears its own scope; source recovery needs its permit.
             if item.get('state', 'closed') == 'closed':
-                item.update(reason='', until=0)
+                item.update(reason='', until=0,retry_check_at=0)
                 continue
             if key not in permits: continue
             item['successes'] = item.get('successes', 0) + 1
             if item['successes'] >= 2:
-                item.update(state='closed', checked_at=stamp(), consecutive=0, reason='', until=0, level=0, successes=0)
+                item.update(state='closed', checked_at=stamp(), consecutive=0, reason='', until=0, level=0, successes=0,
+                            reclaim_after=time.time()+item.get('reclaim_delay',300), reclaim_verified=False)
+                self.history[key].clear()
             else:
                 item.update(state='half_open', until=time.time() + 15, checked_at=stamp())
         self.persist()
@@ -174,6 +187,10 @@ class State:
         model_scope = failure.kind in ('model_unavailable', 'permission_denied')
         key = self.key(ident, model if model_scope else '')
         item = self.items.setdefault(key, {})
+        item['revision']=item.get('revision',0)+1
+        if (item.get('reclaim_after') and not item.get('reclaim_verified')) or item.get('reclaim_active_until',0)>time.time():
+            item.update(state='open',reclaim_delay=min(1800,item.get('reclaim_delay',300)*2),reclaim_after=0,reclaim_verified=False)
+        item['reclaim_active_until']=0
         history = self.history[key]
         history.append(True)
         count = item.get('consecutive', 0) + 1
@@ -187,7 +204,7 @@ class State:
             delay = (30, 60, 120, 300, 600, 900)[min(level, 5)] * random.uniform(.9, 1.1)
             item.update(state='open', until=time.time() + delay, level=level)
         else:
-            item.update(state='closed', until=0)
+            item.update(state='closed', until=0,retry_check_at=time.time()+30)
         self.persist()
 
 
@@ -256,8 +273,9 @@ class Router:
 
     def log(self, ident, started, endpoint, model, trace, status, outcome, usage):
         # No upstream URLs, raw error bodies, session IDs, prompts or tokens.
-        usage = usage or {}
+        usage = usage if isinstance(usage,dict) else {}
         details = usage.get('input_tokens_details') or usage.get('prompt_tokens_details') or {}
+        if not isinstance(details,dict): details={}
         with contextlib.closing(self.db()) as db, db:
             db.execute('INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
                 ident, stamp(), endpoint, 'POST', model,
@@ -291,20 +309,33 @@ class Router:
             current = next((s for s in sources if s['id'] == affinity[0]), None)
             recovered_official = []
             for candidate in sources:
-                if candidate['kind'] != 'oauth' or not candidate.get('authorized', True):
+                if candidate['kind'] != 'oauth' or not candidate.get('enabled') or not candidate.get('authorized', True):
                     continue
                 item = self.state.get(candidate['id'])
                 if item.get('state', 'closed') != 'closed' or item.get('consecutive', 0):
                     continue
-                if item.get('reserve_blocked') or item.get('query_error'):
+                if item.get('reserve_blocked') or item.get('quota_blocked') or item.get('query_error'):
                     continue
+                if reserve_policy(settings)['enabled'] and not item.get('reserve_known'): continue
+                if self.state.get(self.state.key(candidate['id'],model)).get('state','closed')!='closed': continue
                 recovered_official.append(candidate)
             if current and current['kind'] != 'oauth' and recovered_official:
                 recovered_ids = {s['id'] for s in recovered_official}
                 sources.sort(key=lambda s: (0 if s['id'] in recovered_ids else 1,
                                             0 if s['id'] == affinity[0] else 1))
             else:
-                sources.sort(key=lambda s: s['id'] != affinity[0])
+                reclaim_ids=set()
+                held_since=affinity[2] if len(affinity)>2 else affinity[1]
+                if current and current['kind']=='api' and time.time()-held_since>=1800:
+                    for candidate in sources[:sources.index(current)]:
+                        if candidate['kind']!='api' or not candidate.get('enabled'): continue
+                        scopes=[self.state.get(candidate['id']),self.state.get(self.state.key(candidate['id'],model))]
+                        if not scopes[1].get('last_success_at'): continue
+                        if any(v.get('state','closed')!='closed' or v.get('consecutive',0) or
+                               (v.get('reclaim_after') and (v['reclaim_after']>time.time() or not v.get('reclaim_verified'))) for v in scopes): continue
+                        if scopes[0].get('probe_model') and scopes[0]['probe_model']!=model and scopes[0].get('reclaim_after'): continue
+                        reclaim_ids.add(candidate['id'])
+                sources.sort(key=lambda s: (0 if s['id'] in reclaim_ids else 1, s['id'] != affinity[0]))
         # previous_response_id may only go back to its original source in this process.
         previous = body.get('previous_response_id')
         if previous:
@@ -312,12 +343,17 @@ class Router:
             if not owner or time.time() - owner[1] > 3600:
                 raise Failure('continuation_requires_full_history', 409)
             sources = [s for s in sources if s['id'] == owner[0]]
+        elif not sources:
+            raise Failure('model_unavailable',404)
         return model, sources, session, bool(previous)
 
-    def remember(self, source, session, response_id):
+    def remember(self, source, session, response_id, started=None):
         for mapping, key in ((self.sessions, session), (self.responses, response_id)):
             if key:
-                mapping[key] = (source, time.time())
+                old=mapping.get(key)
+                if mapping is self.sessions and old and len(old)>3 and started is not None and old[3]>started: continue
+                held_since=old[2] if mapping is self.sessions and old and old[0]==source and len(old)>2 and time.time()-old[1]<3600 else time.time()
+                mapping[key] = (source, time.time(), held_since, started or time.monotonic())
                 mapping.move_to_end(key)
                 while len(mapping) > 5000: mapping.popitem(last=False)
 
@@ -334,6 +370,8 @@ class Router:
             body = await request.json()
             if not isinstance(body, dict) or not isinstance(body.get('model'), str): raise ValueError()
             if body.get('reasoning') is not None and not isinstance(body['reasoning'], dict): raise ValueError()
+            if 'n' in body and (type(body['n']) is not int or body['n']<1): raise ValueError()
+            if body.get('previous_response_id') is not None and not isinstance(body['previous_response_id'],str): raise ValueError()
             if body.get('background'): raise Failure('background_not_supported', 400)
         except Failure as failure:
             return web.json_response({'error': {'code': failure.kind}}, status=failure.status)
@@ -371,12 +409,20 @@ class Router:
                     self.state.release(permits)
                     raise Failure('budget_exhausted', 504)
                 row.update(action='attempt', reason='in_progress')
+                old=self.sessions.get(session) if session else None
+                ordered=[s['id'] for s in self.settings()['sources']]
+                if old and time.time()-old[1]<3600 and old[0]!=source['id'] and body['model']==model and not continuation and old[0] in ordered and ordered.index(source['id'])<ordered.index(old[0]):
+                    row['selection']='official_reclaim' if source['kind']=='oauth' else 'relay_reclaim'
+                    if source['kind']=='api':
+                        for scope in (source['id'],self.state.key(source['id'],model)):
+                            self.state.items.setdefault(scope,{})['reclaim_active_until']=time.time()+1800
+                versions={key:self.state.get(key).get('revision',0) for key in (source['id'],self.state.key(source['id'],model))}
                 tick = time.monotonic()
                 try:
                     result, usage, response_id = await self.attempt(request, body, source, model, long, budget)
                     status, outcome = 200, 'success'
-                    self.state.success(source['id'], model, permits)
-                    self.remember(source['id'], session, response_id)
+                    self.state.success(source['id'], model, permits, versions)
+                    self.remember(source['id'], session, response_id, started)
                     row.update(reason='success', seconds=round(time.monotonic() - tick, 2))
                     return result
                 except Failure as failure:
@@ -391,7 +437,7 @@ class Router:
                 finally:
                     self.state.release(permits)
             retry = min([max(1, int((v.get('until') or v.get('next_check') or 0) - time.time())) for k, v in self.state.items.items() if k.split('/')[0] in {s['id'] for s in sources} and (v.get('until') or v.get('next_check') or 0) > time.time()] or [60])
-            return web.json_response({'error': {'code': outcome, 'message': '可用来源均未完成请求；请查看控制面板的切换记录。', 'request_id': request_id}}, status=status, headers={'Retry-After': str(retry)})
+            return web.json_response({'error': {'code': outcome, 'message': '可用来源均未完成请求；请查看控制面板的切换记录。', 'request_id': request_id, 'attempted': any(t['action']=='attempt' for t in trace)}}, status=status, headers={'Retry-After': str(retry)})
         except asyncio.CancelledError:
             status, outcome = 499, 'client_cancelled'
             if trace and trace[-1].get('reason') == 'in_progress': trace[-1]['reason'] = outcome
@@ -399,10 +445,13 @@ class Router:
         except Failure as failure:
             status, outcome = failure.status, failure.kind
             return web.json_response({'error': {'code': outcome}}, status=status)
+        except Exception:
+            status,outcome=500,'internal_router_error'
+            return web.json_response({'error':{'code':outcome,'request_id':request_id}},status=status)
         finally:
             self.log(request_id, started, request.path, model, trace, status, outcome, usage)
 
-    async def attempt(self, downstream, body, source, model, long, budget):
+    async def attempt(self, downstream, body, source, model, long, budget, probe=False):
         directed = dict(body, model=source['id'] + '/' + model)
         headers = {'Authorization': 'Bearer ' + self.keys['client'], 'Content-Type': 'application/json'}
         # Preserve protocol controls, but not an affinity key shared across directed lanes.
@@ -416,7 +465,7 @@ class Router:
         try:
             try:
                 async with asyncio.timeout_at(asyncio.get_running_loop().time() + max(.001, precommit_deadline - time.monotonic())):
-                    upstream = await self.client.post(GATEWAY + downstream.path, json=directed, headers=headers, timeout=timeout)
+                    upstream = await self.client.post(GATEWAY + ('/v1/responses' if probe else downstream.path), json=directed, headers=headers, timeout=timeout)
             except TimeoutError: raise Failure('first_event_timeout', 504)
             async with upstream:
                 if upstream.status >= 400:
@@ -433,7 +482,7 @@ class Router:
                     except TimeoutError: raise Failure('response_timeout', 504)
                     except ValueError: raise Failure('invalid_response', 502)
                     if not isinstance(obj, dict) or obj.get('error') or obj.get('status') in ('failed', 'incomplete'):
-                        raise classify(502, obj if isinstance(obj, dict) else {})
+                        raise classify(502, obj if isinstance(obj, dict) else {}, official=source['kind']=='oauth')
                     if downstream.path.endswith('/responses') and obj.get('status') != 'completed': raise Failure('invalid_response', 502)
                     if downstream.path.endswith('/completions') and not obj.get('choices'): raise Failure('invalid_response', 502)
                     return web.Response(body=raw, content_type='application/json'), obj.get('usage', {}), obj.get('id')
@@ -442,6 +491,7 @@ class Router:
                 buffer, pending, valid, committed, complete = b'', [], False, False, False
                 began, last_progress = time.monotonic(), time.monotonic()
                 usage, response_id = {}, None
+                finished_choices=set()
                 # Bound precommit buffering; heartbeat bytes never reset clocks.
                 buffered = 0
                 while True:
@@ -469,26 +519,38 @@ class Router:
                         except ValueError: raise Failure('invalid_response', 502)
                         if not isinstance(obj, dict): raise Failure('invalid_response', 502)
                         typ = obj.get('type', '')
+                        if not isinstance(typ,str): raise Failure('invalid_response',502)
                         if typ in ('error', 'response.failed', 'response.incomplete') or obj.get('error'):
                             raise classify(502, obj.get('response') or obj, official=source['kind'] == 'oauth')
-                        valid = bool(typ.startswith('response.') or obj.get('object') == 'chat.completion.chunk') or valid
-                        if not valid: raise Failure('invalid_response', 502)
+                        event_valid=typ.startswith('response.') if not downstream.path.endswith('/completions') else obj.get('object')=='chat.completion.chunk'
+                        if not event_valid: raise Failure('invalid_response',502)
+                        valid=True
                         resp = obj.get('response') or {}
+                        if not isinstance(resp,dict): raise Failure('invalid_response',502)
+                        if typ=='response.completed' and resp.get('status') in ('failed','incomplete'):
+                            raise classify(502,resp,official=source['kind']=='oauth')
                         response_id = resp.get('id') or obj.get('id') or response_id
                         usage = resp.get('usage') or obj.get('usage') or usage
                         choices = obj.get('choices') or []
+                        if not isinstance(choices,list) or any(not isinstance(c,dict) or not isinstance(c.get('delta',{}),dict) for c in choices): raise Failure('invalid_response',502)
+                        for choice in choices:
+                            if choice.get('finish_reason'):
+                                index=choice.get('index',0)
+                                if type(index) is not int: raise Failure('invalid_response',502)
+                                finished_choices.add(index)
                         progress = bool(typ.endswith('.delta') and obj.get('delta'))
                         item = obj.get('item') or {}
+                        if not isinstance(item,dict): raise Failure('invalid_response',502)
                         progress |= typ == 'response.output_item.added' and item.get('type') in ('function_call', 'custom_tool_call')
                         progress |= any(c.get('delta', {}).get('content') or c.get('delta', {}).get('tool_calls') or c.get('delta', {}).get('reasoning_content') for c in choices)
-                        complete = typ == 'response.completed' or any(c.get('finish_reason') for c in choices) or complete
+                        complete = typ == 'response.completed' or len(finished_choices)>=body.get('n',1) or complete
                         frame = frame + b'\n\n'
                         if not committed:
                             pending.append(frame); buffered += len(frame)
                             if buffered > 2 * 1024 * 1024: raise Failure('invalid_response', 502)
                             if progress or complete:
                                 # Once any output or tool event reaches the client, replay is forbidden.
-                                response = web.StreamResponse(status=200, headers={'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+                                response = ProbeSink() if probe else web.StreamResponse(status=200, headers={'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
                                 await response.prepare(downstream)
                                 committed = True
                                 for part in pending: await response.write(part)
@@ -496,7 +558,8 @@ class Router:
                         else:
                             await response.write(frame)
                         if progress or complete: last_progress = time.monotonic()
-                        if typ == 'response.completed':
+                        if typ == 'response.completed' or (downstream.path.endswith('/completions') and complete):
+                            if downstream.path.endswith('/completions'): await response.write(b'data: [DONE]\n\n')
                             await response.write_eof()
                             return response, usage, response_id
                 if not complete: raise Failure('stream_interrupted' if committed else 'empty_stream', 502)
@@ -529,7 +592,7 @@ class Router:
             if response.status != 200:
                 return {'query_error': 'usage_http_' + str(response.status)}
             obj = await response.json()
-        limit = obj.get('rate_limit')
+        limit = obj.get('rate_limit') if isinstance(obj,dict) else None
         if not isinstance(limit, dict) or 'allowed' not in limit: return {'query_error': 'usage_schema_unknown'}
         windows = []
         for name in ('primary_window', 'secondary_window'):
@@ -542,14 +605,18 @@ class Router:
         interval = 60 if policy['enabled'] else 300
         reserve = reserve_status(policy, windows)
         if policy['enabled'] and not reserve['reserve_known']: return {'query_error': 'usage_schema_unknown'}
-        result = {'windows': windows, 'usage_checked_at': stamp(), 'next_check': time.time() + interval, 'query_error': '', **reserve}
+        result = {'windows': windows, 'usage_checked_at': stamp(), 'next_check': time.time() + interval, 'query_error': '', 'quota_blocked':not allowed, **reserve}
         if allowed:
             current = self.state.get(source['id'])
             # A usage endpoint cannot cure unrelated network/permission/auth errors.
-            if current.get('state', 'closed') in ('quota_wait', 'auth_required', 'closed'):
+            if current.get('state')=='quota_wait':
                 result.update(state='closed', reason='', reset_at=0, until=0, consecutive=0)
+            elif current.get('state')=='auth_required':
+                result.update(state='open',until=0)
         else:
-            result.update(state='quota_wait', reason='quota_wait', reset_at=max([w.get('reset_at') or 0 for w in blocked] or [0]), until=0)
+            result['reset_at']=max([w.get('reset_at') or 0 for w in blocked] or [0])
+            if self.state.get(source['id']).get('state','closed') in ('closed','quota_wait'):
+                result.update(state='quota_wait', reason='quota_wait', until=0)
             future = [w['reset_at'] for w in blocked if isinstance(w.get('reset_at'), (int, float)) and w['reset_at'] > time.time()]
             if future: result['next_check'] = min(time.time() + interval, max(future) + 2)
         if reserve['reserve_blocked'] and reserve['reserve_reset_at'] > time.time():
@@ -570,14 +637,18 @@ class Router:
                 self.state.items[ident].update(state='open', until=0)
             # Model probes only run for due breakers. Manual checks can bring the next check forward.
             for key, item in list(self.state.items.items()):
-                if key.split('/')[0] != ident or item.get('state') not in ('open', 'half_open'): continue
+                observing=source['kind']=='api' and item.get('state','closed')=='closed' and item.get('reclaim_after',0)>0 and not item.get('reclaim_verified')
+                unconfirmed=item.get('state','closed')=='closed' and item.get('consecutive',0)>0 and item.get('retry_check_at',0)<=time.time()
+                if key.split('/')[0] != ident or (item.get('state') not in ('open', 'half_open') and not observing and not unconfirmed): continue
+                if observing and item['reclaim_after']>time.time(): continue
                 if manual: item['until'] = 0
                 if item.get('until', 0) > time.time(): continue
                 model = item.get('probe_model')
                 if not model: continue
                 permits, _ = self.state.acquire(ident, model)
                 if permits is None: continue
-                probing = [self.state.items[scope] for scope in permits]
+                probing = [self.state.items[scope] for scope in permits] or [item]
+                versions={scope:self.state.get(scope).get('revision',0) for scope in (ident,self.state.key(ident,model))}
                 for scope in probing:
                     scope.update(probe_in_progress=True, probe_started_at=time.time())
                 self.state.persist()
@@ -587,9 +658,16 @@ class Router:
                     async with self.client.post('http://127.0.0.1:18319/internal/probe', json=body,
                         headers={'Authorization': 'Bearer ' + self.keys['management']}, timeout=aiohttp.ClientTimeout(total=65)) as response:
                         result = await response.json()
-                    if result.get('ok'): self.state.success(ident, model, permits)
+                    for scope in probing:
+                        scope['last_probe'] = {'passed':bool(result.get('ok')), 'reason':result.get('reason','success' if result.get('ok') else 'upstream_error'), 'http':result.get('status'), 'model':model}
+                    if result.get('ok'):
+                        self.state.success(ident, model, permits, versions)
+                        if observing and item.get('revision',0)==versions.get(key,0): item['reclaim_verified']=True
+                        if unconfirmed and item.get('revision',0)==versions.get(key,0): item.update(state='half_open',successes=1,until=time.time()+15)
                     else: self.state.failure(ident, model, Failure(result.get('reason', 'upstream_error'), result.get('status',502), delay=result.get('delay',0), reset=result.get('reset',0)))
-                except (aiohttp.ClientError, TimeoutError, ValueError): self.state.failure(ident, model, Failure('probe_timeout', 504))
+                except (aiohttp.ClientError, TimeoutError, ValueError):
+                    for scope in probing: scope['last_probe'] = {'passed':False,'reason':'probe_timeout','http':504,'model':model}
+                    self.state.failure(ident, model, Failure('probe_timeout', 504))
                 finally:
                     for scope in probing:
                         scope.update(probe_in_progress=False, probe_finished_at=time.time())
@@ -612,31 +690,29 @@ class Router:
             ident = str(body.get('id', ''))
             asyncio.create_task(self.check(ident, True))
             return web.json_response({'ok': True})
-        # Validate a recovery stream locally without sending output to a real client.
-        model = str(body['model'])
-        source = next((s for s in self.settings()['sources'] if model.startswith(s['id'] + '/')), None)
-        if source and source['kind'] == 'oauth':
+        # Recovery follows the same parser, deadlines and error classification.
+        model = str(body.get('model',''))
+        source = next((s for s in self.settings()['sources'] if model.startswith(s['id']+'/')),None)
+        if not source or not source.get('enabled'):
+            return web.json_response({'ok':False,'reason':'manual_paused','status':403})
+        quota = read('quota-state.json',{}).get('quotas',{}).get(source['name'],{})
+        if quota.get('excluded'):
+            return web.json_response({'ok':False,'reason':'balance_wait','status':403})
+        if source['kind']=='oauth':
             await self.refresh_official(source)
-            item = self.state.get(source['id'])
+            item=self.state.get(source['id'])
+            if item.get('quota_blocked') or item.get('state')=='quota_wait':
+                return web.json_response({'ok':False,'reason':'quota_wait','status':429})
             if item.get('reserve_enabled') and (item.get('reserve_blocked') or not item.get('reserve_known') or item.get('query_error')):
-                return web.json_response({'ok': False, 'reason': 'reserve_wait' if item.get('reserve_blocked') else 'reserve_unknown'})
+                return web.json_response({'ok':False,'reason':'reserve_wait' if item.get('reserve_blocked') else 'reserve_unknown','status':503})
         try:
-            async with self.client.post(GATEWAY + '/v1/responses', json=body,
-                    headers={'Authorization': 'Bearer ' + self.keys['client']}, timeout=aiohttp.ClientTimeout(total=60, sock_connect=10)) as response:
-                if response.status >= 400:
-                    try: error = await response.json()
-                    except (ValueError, aiohttp.ClientError): error = {}
-                    raise classify(response.status, error, response.headers, model.startswith('plus-'))
-                if 'text/event-stream' not in response.headers.get('Content-Type', ''): raise Failure('invalid_response')
-                async for line in response.content:
-                    if line.startswith(b'data:'):
-                        try: obj = json.loads(line[5:])
-                        except ValueError: continue
-                        if obj.get('type') == 'response.completed': return web.json_response({'ok': True})
-                        if obj.get('type') in ('error', 'response.failed', 'response.incomplete'): raise classify(502, obj.get('response') or obj, official=model.startswith('plus-'))
-            raise Failure('empty_stream')
-        except Failure as failure: return web.json_response({'ok': False, 'reason': failure.kind,'status':failure.status,'delay':failure.delay,'reset':failure.reset})
-        except (aiohttp.ClientError, TimeoutError): return web.json_response({'ok': False, 'reason': 'probe_timeout'})
+            async with asyncio.timeout(60):
+                await self.attempt(request,body,source,model[len(source['id'])+1:],False,time.monotonic()+60,probe=True)
+            return web.json_response({'ok':True,'status':200})
+        except Failure as failure:
+            return web.json_response({'ok':False,'reason':failure.kind,'status':failure.status,'delay':failure.delay,'reset':failure.reset})
+        except (aiohttp.ClientError,TimeoutError):
+            return web.json_response({'ok':False,'reason':'probe_timeout','status':504})
 
     async def monitor(self):
         while True:
@@ -652,6 +728,8 @@ class Router:
                         self.state.persist()
                 due = source['kind'] == 'oauth' and self.state.get(ident).get('next_check', 0) <= now
                 due |= any(k.split('/')[0] == ident and v.get('state') in ('open', 'half_open') and v.get('until', 0) <= now for k, v in self.state.items.items())
+                due |= source['kind']=='api' and any(k.split('/')[0]==ident and v.get('state','closed')=='closed' and v.get('reclaim_after',0)>0 and v['reclaim_after']<=now and not v.get('reclaim_verified') for k,v in self.state.items.items())
+                due |= any(k.split('/')[0]==ident and v.get('state','closed')=='closed' and v.get('consecutive',0)>0 and v.get('retry_check_at',0)<=now for k,v in self.state.items.items())
                 if due and ident not in self.checking:
                     asyncio.create_task(self.check(ident))
             await asyncio.sleep(5)

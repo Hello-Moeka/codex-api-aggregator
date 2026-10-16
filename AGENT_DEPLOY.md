@@ -133,9 +133,14 @@ $env:RESERVE_REPORT='reports/reserve-verification.json'
 python scripts/verify_routing.py
 python scripts/verify_reserve.py
 python scripts/verify_recovery_timer.py
+python scripts/verify_reclaim.py
+python scripts/verify_audit.py
+node scripts/verify_presentation.cjs
 ```
 
 测试使用临时目录和模拟凭据，不连接真实供应商。报告变量是报告输出位置；部分脚本默认 /tmp，Windows 应按上述设置并确保 reports 存在。
+
+最后一项需要 Node.js。六套检查合计 104 项，覆盖路由、额度预留、恢复计时、30 分钟保持与回迁、审计回归及状态展示。
 
 ### 6.3 真实推理验收，需要用户授权的来源
 
@@ -144,6 +149,8 @@ python scripts/verify_recovery_timer.py
 分别确认无前缀调用的顺序回退、带来源前缀调用不跨来源。模型级无渠道只隔离该模型；超时连续 3 次或最近 10 次有 6 次失败触发来源熔断。恢复探测失败继续退避，连续两次成功恢复。额度预留在任一官方窗口剩余不超过 10% 时跳过账号。
 
 官方恢复接管只在下一请求边界发生，不打断输出。previous_response_id 仍绑定原来源，无法安全跨来源续接时应提交完整历史。进程重启不保留会话/response_id 映射。不要用真实账号故意耗尽额度来做验收。
+
+中转站会话保持至少 30 分钟；靠前来源恢复需要两次成功、默认 5 分钟观察和额外验证。当前来源故障立即回退；官方恢复接管不受 30 分钟限制。健康 Plus B 不会被 Plus A 主动抢占。完整规则及按钮区别见 [切换逻辑说明](docs/切换逻辑说明.md)。
 
 报告必须区分：结构验证、模拟验证、真实上游验证、客户端验收；未测项明确标记。不要声称用户设备端可用，除非实际从该设备验证。
 

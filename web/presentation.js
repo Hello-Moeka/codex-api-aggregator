@@ -8,6 +8,8 @@ function balanceCny(quota){
 }
 function testStillFailed(source){
   const test=source.last_test;
+  // A rejected test reflects admission policy at that time, not current health.
+  if(test?.skipped||test?.http===503&&test.error?.includes('等待恢复'))return false;
   return !!test&&!test.passed&&!(Date.parse(source.routing?.last_success_at)>Date.parse(test.checked_at));
 }
 function probeSchedule(item,now=Date.now()/1000){
@@ -26,11 +28,11 @@ function sourceAppearance(source){
   const r=source.routing||{},q=source.quota||{},v=r.state||'closed';
   if(!source.enabled)return {tone:'neutral',label:'已暂停'};
   if(v==='auth_required'||source.kind==='oauth'&&!source.authorized)return {tone:'error',label:'需要授权'};
-  if(['quota_wait','balance_wait'].includes(v)||q.excluded||q.status==='exhausted')return {tone:'waiting',label:'等待额度恢复'};
-  if(v==='open'||r.consecutive>0)return {tone:'error',label:'请求异常'};
+  if(r.quota_blocked||['quota_wait','balance_wait'].includes(v)||q.excluded||q.status==='exhausted')return {tone:'waiting',label:'等待额度恢复'};
   if(v==='half_open')return {tone:'waiting',label:'恢复验证中'};
-  if(Object.keys(source.model_routing||{}).length)return {tone:'error',label:'部分模型异常'};
   if(r.reserve_enabled&&(r.reserve_blocked||!r.reserve_known||r.query_error))return {tone:'waiting',label:'额度保护中'};
+  if(v==='open'||r.consecutive>0)return {tone:'error',label:'请求异常'};
+  if(Object.keys(source.model_routing||{}).length)return {tone:'error',label:'部分模型异常'};
   if(testStillFailed(source))return {tone:'error',label:'最近测试失败'};
   if(source.kind==='api'&&q.status!=='available')return {tone:'waiting',label:'余额待确认'};
   if(r.query_error)return {tone:'waiting',label:'额度待确认'};
@@ -65,10 +67,10 @@ function sourceStatus(source){
   const a=sourceAppearance(source),r=source.routing||{},q=source.quota||{};
   let icon=a.tone,reason='',label=a.label;
   if(!source.enabled){icon='paused';reason='已停止参与自动选路'}
-  else if(label==='需要授权'){reason='登录已失效或尚未完成授权'}
+  else if(label==='需要授权'){reason=source.kind==='oauth'?'登录已失效或尚未完成授权':'上游 API 凭据失效，请更新密钥'}
   else if(label==='等待额度恢复'){
-    reason=r.state==='quota_wait'?'官方额度已耗尽':'上游余额已耗尽';
-    if(r.reset_at)reason+=' · 预计 '+routingTime(r.reset_at)+' 恢复';
+    reason=r.state==='quota_wait'||r.quota_blocked?'官方额度已耗尽':r.state==='balance_wait'?'上游报告额度不足，等待余额确认及恢复验证':'余额已耗尽';
+    if(r.reset_at)reason+=r.reset_at>Date.now()/1000?' · 预计 '+routingTime(r.reset_at)+' 恢复':' · 预计恢复时间已到，等待查询确认';
   }else if(label==='请求异常'){
     reason=routingLabel(r.reason);
     const schedule=probeSchedule(r);if(schedule)reason+=' · '+schedule;
@@ -78,7 +80,7 @@ function sourceStatus(source){
   }else if(label==='恢复验证中'){reason=probeSchedule(r)||'正在验证上游是否恢复'}
   else if(label==='额度保护中'){
     icon='reserve';reason=r.reserve_blocked?`已达 ${r.reserve_percent}% 预留线`:'剩余额度暂不能确认，保护性跳过';
-    if(r.reserve_blocked&&r.reserve_reset_at)reason+=' · 预计 '+routingTime(r.reserve_reset_at)+' 恢复';
+    if(r.reserve_blocked&&r.reserve_reset_at)reason+=r.reserve_reset_at>Date.now()/1000?' · 预计 '+routingTime(r.reserve_reset_at)+' 恢复':' · 等待查询确认额度恢复';
   }else if(label==='最近测试失败'){
     label='请求异常';reason=`HTTP ${source.last_test?.http||'—'} · ${source.last_test?.error||'最近测试未通过'}`;
   }else if(a.tone==='healthy'){label='正常';reason='最近请求验证通过'}
