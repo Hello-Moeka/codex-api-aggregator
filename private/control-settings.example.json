@@ -1,0 +1,8 @@
+{
+  "sources": [
+    {"id": "plus-a", "name": "Plus A", "kind": "oauth", "slot": "A", "enabled": true},
+    {"id": "plus-b", "name": "Plus B", "kind": "oauth", "slot": "B", "enabled": true}
+  ],
+  "session_affinity": true,
+  "official_reserve": {"enabled": true, "percent": 10}
+}

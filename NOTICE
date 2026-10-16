@@ -1,0 +1,7 @@
+聚合 API
+
+Copyright (C) 2026 the contributors.
+
+This distribution contains an integration point for CLIProxyAPI. The
+CLIProxyAPI executable is not included in this repository. Obtain and use it
+according to its own license and redistribution terms.

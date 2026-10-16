@@ -1,0 +1,14 @@
+/private/*
+!/private/*.example.json
+!/private/auths/
+/private/auths/*
+!/private/auths/.gitkeep
+/reports/
+/runtime/
+/docker/cli-proxy-api
+/compose.yaml
+__pycache__/
+*.pyc
+*.sqlite*
+.env
+*.zip

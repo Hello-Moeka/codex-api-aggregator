@@ -1,0 +1,53 @@
+name: codex-aggregate
+services:
+  init:
+    image: local/codex-aggregate:opensource
+    command: ["sh", "-c", "python /app/scripts/bootstrap_open_source.py && PREPARE_ONLY=1 python /app/scripts/controller.py"]
+    volumes: ["./private:/app/private"]
+    environment: {TZ: Asia/Shanghai, GATEWAY_URL: http://gateway:18317, ROUTER_URL: http://router:18319}
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: local/codex-aggregate:opensource
+    depends_on: {init: {condition: service_completed_successfully}}
+    command: ["/usr/local/bin/cli-proxy-api", "-config", "/app/private/docker-config.yaml", "-local-model"]
+    working_dir: /app/private
+    restart: unless-stopped
+    volumes:
+      - ./private:/app/private
+    environment: {TZ: Asia/Shanghai}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:18317/').status==200"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+  router:
+    image: local/codex-aggregate:opensource
+    command: ["python", "/app/scripts/router.py"]
+    restart: unless-stopped
+    depends_on: {gateway: {condition: service_healthy}}
+    ports:
+      - "127.0.0.1:18317:18319"
+    volumes: ["./private:/app/private"]
+    environment: {TZ: Asia/Shanghai, GATEWAY_URL: http://gateway:18317}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:18319/health').status==200"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+  panel:
+    image: local/codex-aggregate:opensource
+    command: ["python", "/app/scripts/controller.py"]
+    restart: unless-stopped
+    depends_on:
+      gateway: {condition: service_healthy}
+      router: {condition: service_healthy}
+    ports: ["127.0.0.1:18318:18318"]
+    volumes:
+      - ./private:/app/private
+      - ./web:/app/web:ro
+      - ./reports:/app/reports
+    environment: {TZ: Asia/Shanghai, GATEWAY_URL: http://gateway:18317, ROUTER_URL: http://router:18319}

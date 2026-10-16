@@ -1,0 +1,10 @@
+**
+!docker/
+!docker/Dockerfile
+!docker/cli-proxy-api
+!scripts/
+!scripts/controller.py
+!scripts/router.py
+!scripts/bootstrap_open_source.py
+!web/
+!web/**
