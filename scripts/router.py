@@ -96,7 +96,9 @@ def classify(status, payload, headers=None, official=False):
             if not math.isfinite(reset): reset=0
             if reset > 1e12: reset /= 1000
         except (ValueError, TypeError): reset = 0
-        return Failure('quota_wait' if official else 'balance_wait', 429 if official else 403, reset=reset)
+        # Only the provider's dedicated balance endpoint is authoritative for
+        # balance. A relay's inference response is model-specific evidence.
+        return Failure('quota_wait' if official else 'model_unavailable', 429 if official else 403, reset=reset)
     if status == 401:
         return Failure('auth_required', 401)
     if status == 403:
@@ -145,7 +147,7 @@ class State:
         for key in (ident, self.key(ident, model)):
             item = self.get(key)
             state = item.get('state', 'closed')
-            if state in ('quota_wait', 'balance_wait', 'auth_required'):
+            if state in ('quota_wait', 'balance_wait', 'model_balance_wait', 'auth_required'):
                 return None, state
             if item.get('quota_blocked'): return None, 'quota_wait'
             if item.get('reserve_enabled'):
@@ -184,7 +186,7 @@ class State:
 
     def failure(self, ident, model, failure):
         if failure.kind in ('invalid_request', 'client_cancelled', 'budget_exhausted'): return
-        model_scope = failure.kind in ('model_unavailable', 'permission_denied')
+        model_scope = failure.kind in ('model_unavailable', 'permission_denied', 'model_balance_wait')
         key = self.key(ident, model if model_scope else '')
         item = self.items.setdefault(key, {})
         item['revision']=item.get('revision',0)+1
@@ -195,7 +197,7 @@ class State:
         history.append(True)
         count = item.get('consecutive', 0) + 1
         item.update(reason=failure.kind, checked_at=stamp(), consecutive=count, probe_model=model, successes=0)
-        if failure.kind in ('quota_wait', 'balance_wait', 'auth_required'):
+        if failure.kind in ('quota_wait', 'balance_wait', 'model_balance_wait', 'auth_required'):
             item.update(state=failure.kind, reset_at=failure.reset, until=0, next_check=time.time() + 300)
         elif failure.kind == 'rate_limited':
             item.update(state='open', until=time.time() + failure.delay)
@@ -235,6 +237,14 @@ class Router:
 
     def settings(self):
         return read('control-settings.json', {'sources': [], 'session_affinity': True})
+
+    def default_probe_model(self, source):
+        """Use the configured default model for recovery, never the failing model."""
+        models = source.get('models', [])
+        aliases = [m.get('alias') for m in models if isinstance(m, dict) and m.get('alias')]
+        if source.get('kind') == 'oauth':
+            aliases = read('official-models.json', {}).get(source['id'], aliases)
+        return 'gpt-6.1-sol' if 'gpt-6.1-sol' in aliases else (aliases[0] if aliases else 'gpt-6.1-sol')
 
     def apply_reserve(self, source):
         if source['kind'] != 'oauth': return
@@ -643,7 +653,7 @@ class Router:
                 if observing and item['reclaim_after']>time.time(): continue
                 if manual: item['until'] = 0
                 if item.get('until', 0) > time.time(): continue
-                model = item.get('probe_model')
+                model = self.default_probe_model(source) if item.get('reason') in ('model_balance_wait', 'balance_wait') else item.get('probe_model')
                 if not model: continue
                 permits, _ = self.state.acquire(ident, model)
                 if permits is None: continue
@@ -730,6 +740,7 @@ class Router:
                 due |= any(k.split('/')[0] == ident and v.get('state') in ('open', 'half_open') and v.get('until', 0) <= now for k, v in self.state.items.items())
                 due |= source['kind']=='api' and any(k.split('/')[0]==ident and v.get('state','closed')=='closed' and v.get('reclaim_after',0)>0 and v['reclaim_after']<=now and not v.get('reclaim_verified') for k,v in self.state.items.items())
                 due |= any(k.split('/')[0]==ident and v.get('state','closed')=='closed' and v.get('consecutive',0)>0 and v.get('retry_check_at',0)<=now for k,v in self.state.items.items())
+                due |= source['kind']=='api' and any(k.split('/')[0]==ident and v.get('state')=='model_balance_wait' and v.get('next_check',0)<=now for k,v in self.state.items.items())
                 if due and ident not in self.checking:
                     asyncio.create_task(self.check(ident))
             await asyncio.sleep(5)

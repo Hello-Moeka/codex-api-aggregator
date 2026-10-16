@@ -114,6 +114,9 @@ async def main():
     r.log('malformed-usage',time.monotonic(),'/v1/responses','m',[],200,'success',['bad'])
     r.log('malformed-details',time.monotonic(),'/v1/responses','m',[],200,'success',{'input_tokens_details':['bad']})
     ok('malformed optional usage cannot break completed request logging',True)
+    api_source={'id':'a','kind':'api','models':[{'alias':'gpt-6.1-sol'},{'alias':'gpt-5.6-luna'}]}
+    ok('relay quota response is model unavailable',m.classify(403,{'error':{'code':'insufficient_quota'}},official=False).kind=='model_unavailable')
+    ok('recovery probe defaults to gpt-6.1-sol',r.default_probe_model(api_source)=='gpt-6.1-sol')
     # Load only the pure probe function; never execute controller startup/config.
     tree=ast.parse(Path('scripts/controller.py').read_text(encoding='utf-8-sig'))
     fn=next(x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=='probe_stream')

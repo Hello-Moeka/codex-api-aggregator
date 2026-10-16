@@ -69,7 +69,7 @@ function sourceStatus(source){
   if(!source.enabled){icon='paused';reason='已停止参与自动选路'}
   else if(label==='需要授权'){reason=source.kind==='oauth'?'登录已失效或尚未完成授权':'上游 API 凭据失效，请更新密钥'}
   else if(label==='等待额度恢复'){
-    reason=r.state==='quota_wait'||r.quota_blocked?'官方额度已耗尽':r.state==='balance_wait'?'上游报告额度不足，等待余额确认及恢复验证':'余额已耗尽';
+    reason=r.state==='quota_wait'||r.quota_blocked?'官方额度已耗尽':r.state==='balance_wait'?'来源报告余额不足，等待余额确认及恢复验证':'余额已耗尽';
     if(r.reset_at)reason+=r.reset_at>Date.now()/1000?' · 预计 '+routingTime(r.reset_at)+' 恢复':' · 预计恢复时间已到，等待查询确认';
   }else if(label==='请求异常'){
     reason=routingLabel(r.reason);

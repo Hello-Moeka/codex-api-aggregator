@@ -29,7 +29,7 @@ check('Future cooldown keeps its real deadline',()=>assert.equal(probeSchedule({
 check('Old admission rejection cannot mark a currently unblocked source failed',()=>assert.equal(sourceStatus({...source,last_test:{passed:false,http:503,error:'该来源当前在等待恢复；可点击检查恢复'}}).label,'待验证'));
 check('Half-open verification wins over an old failure counter',()=>assert.equal(sourceStatus({...source,routing:{state:'half_open',consecutive:1}}).label,'恢复验证中'));
 check('Reserve explains current exclusion despite historical connection errors',()=>assert.equal(sourceStatus({...source,routing:{state:'open',consecutive:2,reserve_enabled:true,reserve_known:true,reserve_blocked:true}}).label,'额度保护中'));
-check('Positive queried balance does not mislabel upstream quota rejection',()=>assert.match(sourceStatus({...source,routing:{state:'balance_wait'}}).reason,/上游报告额度不足/));
+check('Positive queried balance does not mislabel upstream quota rejection',()=>assert.match(sourceStatus({...source,routing:{state:'balance_wait'}}).reason,/来源报告余额不足/));
 check('API credentials use an API-specific authorization message',()=>assert.match(sourceStatus({...source,routing:{state:'auth_required'}}).reason,/API 凭据/));
 check('Past quota reset is pending confirmation rather than a future promise',()=>assert.match(sourceStatus({...source,routing:{state:'quota_wait',reset_at:1}}).reason,/等待查询确认/));
 fs.writeFileSync('reports/presentation-verification.json',JSON.stringify({checks},null,2));

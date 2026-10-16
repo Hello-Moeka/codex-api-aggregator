@@ -75,6 +75,7 @@ docker compose version
 - TopAPI 类余额结构使用 usage_kind: topapi，并填 usage_url 和 usage_headers；返回需为 success:true、data.balance/data.used/data.currency。
 - New API 类余额使用 usage_kind: newapi，返回需为 success:true、data.quota/data.used_quota，当前按 500000 额度单位折算 1 CNY。不同站点换算不同时应先适配代码，不盲目套用。
 - usage_headers 为完整的余额查询请求头对象，可能与推理 Key 不同，不假设接口或鉴权方式通用。
+- 中转来源的余额字段只由独立余额查询接口决定。推理 API 返回 insufficient_quota、quota_exceeded 或“余额不足”时，按当前来源+当前模型的 model_unavailable 处理，继续尝试其他来源，不修改来源余额状态。
 - disable_codex_cloaking 为 true 时可配置 headers 适配上游。默认不要额外伪造客户端头。
 - 当前展示固定按 1 USD = 7 CNY，原余额判断及扣费不变。
 
@@ -108,6 +109,7 @@ init 会自动运行 bootstrap，然后以 PREPARE_ONLY=1 运行控制器，生�
 访问控制面板 `http://127.0.0.1:18318/`，在对应 Plus 槽位启动设备码登录，由用户完成授权。第三方来源在“上游模型”中手动同步目录。来源增删目前需要配置文件操作，面板支持已有来源的启停、排序、同步、测试和恢复检查。
 
 本版本一键全部测试固定使用 gpt-6.1-sol；单来源测试可以选择目录中的其他模型。不要把不存在该模型时的一键跳过当成供应商故障。
+恢复探测同样默认优先使用 gpt-6.1-sol；如果来源目录没有该模型，则使用该来源目录的第一个模型。不会因为某个模型的推理余额错误而用该模型代表整个来源。
 
 ## 6. 验收顺序
 
