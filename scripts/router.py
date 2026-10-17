@@ -25,6 +25,7 @@ DATA = Path(os.environ.get('ROUTER_DATA', '/app/private'))
 GATEWAY = os.environ.get('GATEWAY_URL', 'http://gateway:18317')
 TZ = datetime.timezone(datetime.timedelta(hours=8))
 MODEL_ERROR_IDLE_TTL = 3600
+RELAY_MIN_HOLD_SECONDS = 600
 
 
 def read(name, default=None):
@@ -587,7 +588,7 @@ class Router:
             else:
                 reclaim_ids=set()
                 held_since=affinity[2] if len(affinity)>2 else affinity[1]
-                if current and current['kind']=='api' and time.time()-held_since>=1800:
+                if current and current['kind']=='api' and time.time()-held_since>=RELAY_MIN_HOLD_SECONDS:
                     for candidate in sources[:sources.index(current)]:
                         if candidate['kind']!='api' or not candidate.get('enabled'): continue
                         scopes=[self.state.get(candidate['id']),self.state.get(self.state.key(candidate['id'],model))]

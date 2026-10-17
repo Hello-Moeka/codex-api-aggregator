@@ -12,13 +12,17 @@ with tempfile.TemporaryDirectory() as td:
  sid=hashlib.sha256(b's').hexdigest()
  def order(body=None):return [s['id'] for s in r.candidates(body or {'model':'m'},{'session_id':'s'})[1]]
  with patch.object(m.time,'time',return_value=10000):
-  r.sessions[sid]=('c',9990,8300);r.state.items['a/m']={'last_success_at':'ok'}
-  check('under 30 minutes remains sticky',order()[0]=='c')
-  r.remember('c',sid,None);check('normal request preserves switch clock',r.sessions[sid][2]==8300)
-  r.sessions[sid]=('c',9990,8000)
+  r.sessions[sid]=('c',9990,9401);r.state.items['a/m']={'last_success_at':'ok'}
+  check('under 10 minutes remains sticky',order()[0]=='c')
+  r.remember('c',sid,None);check('normal request preserves switch clock',r.sessions[sid][2]==9401)
+  r.sessions[sid]=('c',9990,9400)
   r.state.items['a']={'reclaim_after':9900,'reclaim_verified':False}
   check('observation requires extra successful probe',order()[0]=='c')
   r.state.items['a']['reclaim_verified']=True
+  check('exactly 10 minutes allows reclaim evaluation',order()[0]=='a')
+  r.sessions[sid]=('c',9990,9400.001)
+  check('less than 10 minutes remains sticky',order()[0]=='c')
+  r.sessions[sid]=('c',9990,9399.999)
   check('earliest recovered provider reclaims after hold',order()[0]=='a')
   check('explicit request remains directed',order({'model':'c/m'})==['c'])
   r.responses['resp']=('c',9990)

@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "checks": [
+    "under 10 minutes remains sticky",
+    "normal request preserves switch clock",
+    "observation requires extra successful probe",
+    "exactly 10 minutes allows reclaim evaluation",
+    "less than 10 minutes remains sticky",
+    "earliest recovered provider reclaims after hold",
+    "explicit request remains directed",
+    "previous response retains owner",
+    "model fault prevents reclaim",
+    "new failure invalidates a completed observation",
+    "failed observation reopens circuit and doubles delay",
+    "recovery starts increased observation",
+    "official bypasses relay hold"
+  ]
+}
