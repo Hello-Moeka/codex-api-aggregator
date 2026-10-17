@@ -92,6 +92,127 @@ def error_token(value):
     return value if re.fullmatch(r'[a-z][a-z0-9_.:-]{0,79}', value) else ''
 
 
+def request_capabilities(body):
+    """Fingerprint capability declarations, never persist tool schemas or inputs.
+
+    A rejection of a tool-bearing request does not establish that plain text
+    is unavailable. Different tool schemas/choices get separate retry scopes.
+    """
+    declarations = []
+    labels = set()
+    known = {'function', 'custom', 'image_generation', 'web_search', 'web_search_preview',
+             'file_search', 'code_interpreter', 'computer', 'computer_use_preview', 'mcp',
+             'tool_search', 'namespace'}
+    inputs = []
+    pending = [body.get('input'), body.get('messages')]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, dict):
+            typ = value.get('type')
+            if typ == 'additional_tools':
+                tools = value.get('tools')
+                if isinstance(tools, list) and tools:
+                    declarations.extend(tools)
+            if typ in ('input_image', 'image_url', 'input_audio', 'audio', 'input_file', 'file'):
+                inputs.append(typ)
+            pending.extend(v for k, v in value.items() if k in ('content', 'messages', 'input'))
+    tools = body.get('tools')
+    if isinstance(tools, list) and tools:
+        declarations.extend(tools)
+    for tool in declarations:
+        typ = tool.get('type') if isinstance(tool, dict) else None
+        labels.add(typ if isinstance(typ, str) and typ in known else 'other_tool')
+    labels.update('input:' + typ for typ in inputs)
+    modalities = body.get('modalities')
+    if isinstance(modalities, list):
+        labels.update('output:' + typ for typ in modalities if typ in ('audio', 'image'))
+    if not labels:
+        return None
+    # Only the digest and known type labels leave memory. Argument values,
+    # image URLs, tool descriptions and conversation text are never saved.
+    normalized = {'tools': declarations, 'tool_choice': body.get('tool_choice'),
+                  'parallel_tool_calls': body.get('parallel_tool_calls'),
+                  'inputs': sorted(set(inputs)), 'modalities': sorted(labels)}
+    digest = hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=True).encode()).hexdigest()[:24]
+    return {'fingerprint': digest, 'features': sorted(labels)}
+
+
+class CapabilityHealth:
+    """Independent cooldowns retried by matching real requests, never text probes."""
+    def __init__(self, directory=DATA):
+        self.path = directory / 'capability-state.json'
+        try:
+            self.items = json.loads(self.path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            self.items = {}
+        self.active = set()
+        self.revisions = collections.defaultdict(int)
+        self.revision_counter = 0
+        self.limit = 2000
+
+    def persist(self):
+        tmp = self.path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(self.items, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.replace(tmp, self.path)
+
+    def key(self, ident, model, capability):
+        return ident + '/' + model + '/' + capability['fingerprint']
+
+    def acquire(self, ident, model, capability):
+        if capability is None:
+            return None, None
+        key = self.key(ident, model, capability)
+        item = self.items.get(key)
+        if item:
+            if item.get('until', 0) > time.time() or key in self.active:
+                return None, 'capability_unavailable'
+            self.active.add(key)
+        return (key, self.revisions.get(key, 0)), None
+
+    def release(self, permit):
+        if permit:
+            self.active.discard(permit[0])
+
+    def success(self, permit):
+        if permit and self.revisions.get(permit[0], 0) == permit[1] and permit[0] in self.items:
+            del self.items[permit[0]]
+            self.revisions.pop(permit[0], None)
+            self.persist()
+
+    def failure(self, ident, model, capability, failure):
+        if capability is None:
+            return
+        key = self.key(ident, model, capability)
+        old = self.items.get(key, {})
+        count = old.get('consecutive', 0) + 1
+        self.revision_counter += 1
+        self.revisions[key] = self.revision_counter
+        self.items[key] = {'source': ident, 'model': model, **capability,
+                           'reason': 'capability_unavailable', 'original_reason': failure.kind,
+                           'http': failure.status, 'checked_at': stamp(),
+                           'last_client_request_at': time.time(), 'consecutive': count,
+                           'until': time.time() + min(900, 30 * 2 ** min(count - 1, 5))}
+        while len(self.items) > self.limit:
+            expired = next((k for k in self.items if k not in self.active and k != key), None)
+            if expired is None:
+                break
+            del self.items[expired]
+            self.revisions.pop(expired, None)
+        self.persist()
+
+    def expire(self, ttl=MODEL_ERROR_IDLE_TTL):
+        removed = [key for key, item in self.items.items()
+                   if key not in self.active and time.time() - item.get('last_client_request_at', 0) >= ttl]
+        for key in removed:
+            del self.items[key]
+            self.revisions.pop(key, None)
+        if removed:
+            self.persist()
+        return removed
+
+
 def classify(status, payload, headers=None, official=False, transport_status=None):
     """Normalize structured errors before HTTP fallback; never save messages."""
     chain = []
@@ -138,6 +259,10 @@ def classify(status, payload, headers=None, official=False, transport_status=Non
     if all_codes & context: return result('invalid_request', 400)
     if identifiers & {'previous_response_not_found','previous_response_id_not_found'}:
         return result('continuation_requires_full_history', 409)
+    if identifiers & {'unsupported_tool', 'unsupported_tool_type', 'tool_not_supported',
+                      'unsupported_feature', 'unsupported_modality', 'unsupported_image',
+                      'image_generation_not_supported'}:
+        return result('capability_unavailable', 400)
     if identifiers & {'get_channel_failed','model_not_found','model_not_supported','model_not_available',
                       'channel:no_available_key','channel:model_mapped_error','model_price_error'}:
         return result('model_unavailable', 503)
@@ -304,7 +429,7 @@ class State:
         self.persist()
 
     def failure(self, ident, model, failure):
-        if failure.kind in STOP_FAILURES | {'client_cancelled', 'budget_exhausted'}: return
+        if failure.kind in STOP_FAILURES | {'client_cancelled', 'budget_exhausted', 'capability_unavailable'}: return
         model_scope = failure.kind in ('model_unavailable', 'permission_denied', 'model_balance_wait')
         key = self.key(ident, model if model_scope else '')
         item = self.items.setdefault(key, {})
@@ -339,6 +464,7 @@ class Router:
     def __init__(self):
         self.keys = read('secrets.json', {})
         self.state = State()
+        self.capabilities = CapabilityHealth()
         self.sessions = collections.OrderedDict()
         self.responses = collections.OrderedDict()
         self.client = None
@@ -519,6 +645,7 @@ class Router:
         request_id = secrets.token_hex(16)
         try:
             model, sources, session, continuation = self.candidates(body, request.headers)
+            capability = request_capabilities(body)
             effort = (body.get('reasoning') or {}).get('effort') or body.get('reasoning_effort')
             long = effort in ('high', 'xhigh', 'max', 'ultra')
             budget = started + (600 if long else 180) * self.clock_scale
@@ -543,6 +670,12 @@ class Router:
                 if time.monotonic() >= budget:
                     self.state.release(permits)
                     raise Failure('budget_exhausted', 504)
+                cap_permit, cap_reason = self.capabilities.acquire(source['id'], model, capability)
+                if cap_reason:
+                    self.state.release(permits)
+                    row.update(reason=cap_reason, capabilities=capability['features'])
+                    status, outcome = 503, cap_reason
+                    continue
                 row.update(action='attempt', reason='in_progress')
                 self.state.mark_client_request(source['id'], model)
                 old=self.sessions.get(session) if session else None
@@ -558,23 +691,41 @@ class Router:
                     result, usage, response_id = await self.attempt(request, body, source, model, long, budget)
                     status, outcome = 200, 'success'
                     self.state.success(source['id'], model, permits, versions)
+                    self.capabilities.success(cap_permit)
                     self.remember(source['id'], session, response_id, started)
                     row.update(reason='success', seconds=round(time.monotonic() - tick, 2))
                     return result
                 except Failure as failure:
+                    # No evidence that the base model is down when only a
+                    # capability-bearing request was rejected. Keep its body
+                    # intact for fallback and isolate this combination only.
+                    capability_only = capability is not None and failure.kind in ('model_unavailable', 'permission_denied', 'capability_unavailable')
                     row.update(reason=failure.kind, seconds=round(time.monotonic() - tick, 2))
                     if getattr(failure, 'diagnostic', None): row['upstream_error'] = failure.diagnostic
-                    self.state.failure(source['id'], model, failure)
-                    status, outcome = failure.status, failure.kind
+                    if capability_only:
+                        self.capabilities.failure(source['id'], model, capability, failure)
+                        row.update(reason='capability_unavailable', original_reason=failure.kind,
+                                   capabilities=capability['features'])
+                    else:
+                        self.state.failure(source['id'], model, failure)
+                    status, outcome = failure.status, 'capability_unavailable' if capability_only else failure.kind
                     if getattr(failure, 'committed', False):
                         # attempt has already sent an SSE error and closed the stream.
                         status = 200
                         return failure.response
                     if continuation or failure.kind in STOP_FAILURES: break
                 finally:
+                    self.capabilities.release(cap_permit)
                     self.state.release(permits)
-            retry = min([max(1, int((v.get('until') or v.get('next_check') or 0) - time.time())) for k, v in self.state.items.items() if k.split('/')[0] in {s['id'] for s in sources} and (v.get('until') or v.get('next_check') or 0) > time.time()] or [60])
+            waits = [max(1, int((v.get('until') or v.get('next_check') or 0) - time.time())) for k, v in self.state.items.items() if k.split('/')[0] in {s['id'] for s in sources} and (v.get('until') or v.get('next_check') or 0) > time.time()]
+            if capability is not None:
+                for source in sources:
+                    item = self.capabilities.items.get(self.capabilities.key(source['id'], model, capability), {})
+                    if item.get('until', 0) > time.time():
+                        waits.append(max(1, int(item['until'] - time.time())))
+            retry = min(waits or [60])
             message = {'policy_rejected':'上游拒绝此请求：触发内容或安全策略，请调整输入。',
+                       'capability_unavailable':'可用来源未能完成此能力组合的请求；普通文本可用性独立判断。',
                        'invalid_request':'上游拒绝请求参数或上下文，请调整后重试。',
                        'continuation_requires_full_history':'上游续接状态不可用，请提供完整历史后重试。'}.get(outcome,
                        '可用来源均未完成请求；请查看控制面板的切换记录。')
@@ -876,6 +1027,7 @@ class Router:
         while True:
             now = time.time()
             self.state.expire_idle_model_errors()
+            self.capabilities.expire()
             for source in self.settings()['sources']:
                 ident = source['id']
                 self.apply_reserve(source)

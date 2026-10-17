@@ -33,6 +33,7 @@ function sourceAppearance(source){
   if(r.reserve_enabled&&(r.reserve_blocked||!r.reserve_known||r.query_error))return {tone:'waiting',label:'额度保护中'};
   if(v==='open'||r.consecutive>0)return {tone:'error',label:'请求异常'};
   if(Object.keys(source.model_routing||{}).length)return {tone:'error',label:'部分模型异常'};
+  if((source.capability_routing||[]).length)return {tone:'waiting',label:'部分能力待验证'};
   if(testStillFailed(source))return {tone:'error',label:'最近测试失败'};
   if(source.kind==='api'&&q.status!=='available')return {tone:'waiting',label:'余额待确认'};
   if(r.query_error)return {tone:'waiting',label:'额度待确认'};
@@ -77,6 +78,8 @@ function sourceStatus(source){
   }else if(label==='部分模型异常'){
     icon='partial';const entries=Object.values(source.model_routing||{});
     reason=`${entries.length} 个模型异常 · ${routingLabel(entries[0]?.reason)}`;
+  }else if(label==='部分能力待验证'){
+    icon='partial';reason='特定工具或输入组合被拒绝，普通文本按自身状态选路';
   }else if(label==='恢复验证中'){reason=probeSchedule(r)||'正在验证上游是否恢复'}
   else if(label==='额度保护中'){
     icon='reserve';reason=r.reserve_blocked?`已达 ${r.reserve_percent}% 预留线`:'剩余额度暂不能确认，保护性跳过';

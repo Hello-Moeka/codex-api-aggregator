@@ -12,6 +12,8 @@ const failed={...source,last_test:{passed:false,checked_at:'2026-10-16T10:00:00Z
 check('Normal balance cannot hide failed requests',()=>assert.equal(sourceAppearance(failed).tone,'error'));
 check('Successful recovery supersedes an old failed test',()=>assert.equal(sourceAppearance({...failed,routing:{last_success_at:'2026-10-16T10:01:00Z'}}).tone,'healthy'));
 check('Model faults survive another model success',()=>assert.equal(sourceAppearance({...source,model_routing:{broken:{state:'open'}}}).tone,'error'));
+check('Capability failure has its own status',()=>assert.equal(sourceAppearance({...source,capability_routing:[{model:'m'}]}).label,'部分能力待验证'));
+check('Source fault takes priority over capability warning',()=>assert.equal(sourceAppearance({...source,routing:{state:'open'},capability_routing:[{}]}).label,'请求异常'));
 check('Reserve is amber',()=>assert.equal(sourceAppearance({...source,routing:{reserve_enabled:true,reserve_known:true,reserve_blocked:true}}).tone,'waiting'));
 check('Paused is neutral',()=>assert.equal(sourceAppearance({...failed,enabled:false}).tone,'neutral'));
 check('An open circuit stays red despite prior successes',()=>assert.equal(sourceAppearance({...source,routing:{state:'open'}}).tone,'error'));
@@ -53,5 +55,7 @@ check('Details group quota, recovery and historical tests',()=>{const h=sourceDe
 check('Healthy details omit empty fault section',()=>assert.ok(!sourceDetails({...source,id:'a',last_test:null}).includes('故障与恢复')));
 check('Recovered models appear without increasing fault count',()=>{const h=sourceDetails({...source,id:'a',model_recovery:{m:{state:'closed',reclaim_after:Date.now()/1000+300}}});assert.ok(h.includes('此模型已恢复'));assert.ok(!h.includes('1 个模型异常'))});
 check('Historical test details are collapsed initially',()=>assert.match(sourceDetails({...source,id:'a'}),/<details class="test-history" data-history="a">/));
+check('Capability details distinguish text and matching retry',()=>{const h=sourceDetails({...source,id:'a',capability_routing:[{model:'m',features:['image_generation'],until:Date.now()/1000+30}]});for(const text of ['特定能力组合','普通文本按自身状态选路','图片生成','相同能力请求验证','普通文本探测不会解除能力隔离'])assert.ok(h.includes(text));assert.ok(!h.includes('1 个模型异常'))});
+check('Expired capability cooldown does not promise automatic probing',()=>assert.ok(sourceDetails({...source,id:'a',capability_routing:[{model:'m',features:['function'],until:1}]}).includes('冷却已结束，等待下一次相同能力请求验证')));
 fs.writeFileSync('reports/presentation-verification.json',JSON.stringify({checks},null,2));
 console.log(`${checks.length} presentation checks passed`);

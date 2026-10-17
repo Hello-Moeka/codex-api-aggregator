@@ -20,7 +20,7 @@ LOCK=threading.RLock(); JOB_LOCK=threading.Lock(); LOGIN_LOCK=threading.Lock()
 DEVICE={}; JOB={'busy':False,'message':'就绪'}; EVENTS=deque(maxlen=40)
 CSRF=secrets.token_urlsafe(24)
 APPLY_ERROR=''
-IDS=[p.get('id') or ('provider-'+str(i+1)) for i,p in enumerate(UPSTREAMS)]
+IDS=[p.get('id') or ['topapi-codex','cola','passion8','topapi-plus'][i] for i,p in enumerate(UPSTREAMS)]
 OFFICIAL=['gpt-6.1-sol','gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol','gpt-5.6-terra','gpt-5.6-luna']
 
 def now():return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat(timespec='seconds')
@@ -87,10 +87,9 @@ def render():
                        'request-retry':0,'keys':[{'api-key':p['api_key'],'priority':priority}], 'models':models,
                        'request-scoped-errors':[{'status':400,'match':['context_length_exceeded','context_window_exceeded'],'action':'stop'},
                                                 {'status':403,'match':['insufficient_quota','余额不足'],'action':'continue-and-cooldown'}]}
-        # This API lane accepts standard API requests rather than forced Codex client headers.
-        if p.get('disable_codex_cloaking'):
-            group['headers']=p.get('headers',{})
-            group['keys'][0]['disable-codex-cloaking']=True
+        # API sources share one explicit policy; no provider-name exceptions.
+        # This only controls headers, not all Codex body adaptation.
+        group['keys'][0]['disable-codex-cloaking']=p.get('disable_codex_cloaking',True) is True
         (chat_groups if p.get('api_format')=='openai_chat' else groups).append(group)
     config={'config-version':8,'server':{'host':'0.0.0.0','port':18317},
             'management':{'allow-remote':True,'secret-key':KEYS['management'],'disable-control-panel':True},
@@ -100,6 +99,7 @@ def render():
             'retry':{'request-retry':0,'max-retry-credentials':0,'max-retry-interval':0},
             'cooldown':{'disable-cooling':bool(ROUTER),'save-cooldown-status':not bool(ROUTER),'transient-error-cooldown-seconds':30}},
             'requests':{'tls-handshake-timeout-seconds':10,'passthrough-headers':True,'streaming':{'bootstrap-retries':0}},
+            'multimedia':{'disable-image-generation':'passthrough'},
             'observability':{'logs':{'debug':False,'logging-to-file':True,'logs-max-total-size-mb':20,'request-log':False,'error-logs-max-files':3},
                              'usage':{'usage-statistics-enabled':True,'redis-usage-queue-retention-seconds':3600}}}
     path=DATA/'docker-config.yaml';tmp=path.with_suffix('.tmp')
@@ -125,8 +125,6 @@ def render():
             APPLY_ERROR='配置已保存，等待网关应用：'+type(error).__name__
 
 def quota_one(p):
-    if not p.get('usage_url') or p.get('usage_kind')=='none':
-        return {'status':'unknown','error':'not_configured','checked_at':now()}
     raw=request_json(p['usage_url'],p['usage_headers'])
     if raw.get('success') is not True or not isinstance(raw.get('data'),dict):raise ValueError('查询接口返回失败')
     d=raw['data']
@@ -459,6 +457,8 @@ def status():
             s['routing']=routing.get(s['id'],{})
             s['model_routing']={k[len(s['id'])+1:]:v for k,v in routing.items() if k.startswith(s['id']+'/') and v.get('state','closed')!='closed'}
             s['model_recovery']={k[len(s['id'])+1:]:v for k,v in routing.items() if k.startswith(s['id']+'/') and v.get('state','closed')=='closed' and (v.get('reclaim_after') or v.get('reclaim_required'))}
+            s['capability_routing']=[v for v in load(DATA/'capability-state.json',{}).values()
+                                     if v.get('source')==s['id'] and time.time()-v.get('last_client_request_at',0)<3600]
             s['last_test']=TESTS.get(s['id']);sources.append(s)
         return {'gateway_healthy':healthy,'runtime':'Docker','base_url':'http://127.0.0.1:18317/v1',
                 'sources':sources,'models':models,'job':dict(JOB),'events':list(EVENTS),
