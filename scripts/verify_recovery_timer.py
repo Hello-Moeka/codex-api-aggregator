@@ -18,7 +18,7 @@ async def main():
         data = Path(folder)
         def save(name, value): (data / name).write_text(json.dumps(value), encoding='utf-8')
         save('secrets.json', {'client': 'synthetic-client', 'management': 'synthetic-management'})
-        save('control-settings.json', {'sources': [{'id': 'a', 'name': 'Synthetic', 'kind': 'api', 'enabled': True}]})
+        save('control-settings.json', {'sources': [{'id': 'a', 'name': 'Synthetic', 'kind': 'api', 'enabled': True, 'models':[{'alias':'test'}]}]})
         save('routing-state.json', {'a': {'state': 'closed', 'consecutive': 1, 'until': time.time()-100,
                                        'probe_model': 'test', 'level': 1, 'probe_in_progress': True}})
         os.environ['ROUTER_DATA'] = folder

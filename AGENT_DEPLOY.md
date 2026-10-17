@@ -137,12 +137,15 @@ python scripts/verify_reserve.py
 python scripts/verify_recovery_timer.py
 python scripts/verify_reclaim.py
 python scripts/verify_audit.py
+python scripts/verify_review_fixes.py
+python scripts/verify_model_idle.py
+python scripts/verify_error_classification.py
 node scripts/verify_presentation.cjs
 ```
 
 测试使用临时目录和模拟凭据，不连接真实供应商。报告变量是报告输出位置；部分脚本默认 /tmp，Windows 应按上述设置并确保 reports 存在。
 
-最后一项需要 Node.js。六套检查合计 104 项，覆盖路由、额度预留、恢复计时、30 分钟保持与回迁、审计回归及状态展示。
+最后一项需要 Node.js。九套检查合计 251 项，覆盖路由、额度预留、恢复计时、30 分钟保持与回迁、模型错误闲置清理、结构化错误分类、审计回归及状态展示。
 
 ### 6.3 真实推理验收，需要用户授权的来源
 
@@ -155,6 +158,8 @@ node scripts/verify_presentation.cjs
 中转站会话保持至少 30 分钟；靠前来源恢复需要两次成功、默认 5 分钟观察和额外验证。当前来源故障立即回退；官方恢复接管不受 30 分钟限制。健康 Plus B 不会被 Plus A 主动抢占。完整规则及按钮区别见 [切换逻辑说明](docs/切换逻辑说明.md)。
 
 报告必须区分：结构验证、模拟验证、真实上游验证、客户端验收；未测项明确标记。不要声称用户设备端可用，除非实际从该设备验证。
+
+模型级错误在连续 1 小时没有真实业务尝试后自动清理，后台探测、手动测试及余额查询不续期；清理不等于恢复验证通过。错误分类与 HTTP/SSE 包装的验收边界见 [专门说明](docs/错误分类与模型闲置清理.md)。
 
 ## 7. 升级、回滚和自动启动
 

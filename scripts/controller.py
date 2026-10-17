@@ -201,6 +201,9 @@ def probe_stream(model):
             messages={'get_channel_failed':'该令牌分组没有此模型的可用渠道',
                       'model_unavailable':'该模型暂无渠道或未被此来源提供',
                       'permission_denied':'此来源没有该模型的使用权限',
+                      'access_denied':'来源访问受限，请检查上游访问规则',
+                      'policy_rejected':'上游内容或安全策略拒绝，请调整输入',
+                      'continuation_requires_full_history':'上游续接状态不可用，请提供完整历史',
                       'balance_wait':'上游额度不足，等待余额确认及恢复验证',
                       'quota_wait':'官方额度暂时耗尽，等待实际窗口恢复',
                       'reserve_wait':'已达到官方额度预留线，等待窗口恢复',
@@ -455,6 +458,7 @@ def status():
             routing=load(DATA/'routing-state.json',{})
             s['routing']=routing.get(s['id'],{})
             s['model_routing']={k[len(s['id'])+1:]:v for k,v in routing.items() if k.startswith(s['id']+'/') and v.get('state','closed')!='closed'}
+            s['model_recovery']={k[len(s['id'])+1:]:v for k,v in routing.items() if k.startswith(s['id']+'/') and v.get('state','closed')=='closed' and (v.get('reclaim_after') or v.get('reclaim_required'))}
             s['last_test']=TESTS.get(s['id']);sources.append(s)
         return {'gateway_healthy':healthy,'runtime':'Docker','base_url':'http://127.0.0.1:18317/v1',
                 'sources':sources,'models':models,'job':dict(JOB),'events':list(EVENTS),

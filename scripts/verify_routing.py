@@ -38,6 +38,7 @@ async def main():
             if mode == '503': return web.json_response({'error': {'code': 'server_error'}}, status=503)
             if mode == 'model': return web.json_response({'error': {'code': 'get_channel_failed'}}, status=500)
             if mode == 'bad': return web.json_response({'error': {'code': 'invalid_request_error'}}, status=400)
+            if mode == 'wrapped': return web.json_response({'error': {'type': 'invalid_request_error', 'message': 'data: ' + json.dumps({'error': {'code': 'upstream_unavailable', 'type': 'server_error', 'message': 'Temporary outage'}})}}, status=400)
             if mode == 'rate': return web.json_response({'error': {'code': 'rate_limit'}}, status=429, headers={'Retry-After': '7'})
             if mode == 'quota': return web.json_response({'error': {'code': 'usage_limit_reached', 'resets_at': time.time() + 900}}, status=429)
             if mode == 'html': return web.Response(text='<html>oops</html>', content_type='text/html')
@@ -94,6 +95,15 @@ async def main():
                 assert router.state.get('b/test')['state'] == 'open' and router.state.acquire('b', 'other')[0] is not None
                 passed('model failures do not disable sibling models')
                 reset(a='bad'); assert (await call())[0] == 400 and hits == ['a']; passed('invalid request stops without provider sweep')
+                reset(a='wrapped'); assert (await call())[0] == 200 and hits == ['a', 'b']; passed('wrapped HTTP 400 upstream outage falls back')
+                assert router.state.get('a')['reason'] == 'upstream_error'; passed('wrapped outage records source failure rather than invalid request')
+                for inner, expected in (({'code':'context_length_exceeded'},'invalid_request'), ({'code':'model_not_found'},'model_unavailable'), ({'code':'insufficient_quota'},'model_unavailable')):
+                    wrapped={'error':{'type':'invalid_request_error','message':json.dumps({'error':inner})}}
+                    assert module.classify(400,wrapped).kind==expected
+                passed('nested context model and quota errors retain their own classification')
+                assert module.classify(400,{'error':{'type':'invalid_request_error','message':'upstream_unavailable appears in user input'}}).kind=='invalid_request'
+                assert module.classify(400,{'error':{'type':'invalid_request_error','message':'data: malformed'}}).kind=='invalid_request'
+                passed('plain keywords and malformed nested payload do not trigger fallback')
                 reset(a='503'); assert (await call('a/test'))[0] == 503 and hits == ['a']; passed('explicit source never crosses lanes')
                 reset(a='rate'); await call(); assert 5 < router.state.get('a')['until'] - time.time() <= 7; passed('Retry-After respected')
                 reset(a='html'); assert (await call())[0] == 200 and hits == ['a', 'b']; passed('HTTP 200 HTML rejected before output')

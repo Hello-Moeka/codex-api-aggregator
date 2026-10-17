@@ -25,6 +25,9 @@ with tempfile.TemporaryDirectory() as td:
   check('previous response retains owner',order({'model':'m','previous_response_id':'resp'})==['c'])
   r.state.items['a/m']['state']='open';check('model fault prevents reclaim',order()[0]=='c')
   r.state.items['a/m']['state']='closed'
+  r.state.items['b']={'state':'closed','reclaim_after':9900,'reclaim_verified':True}
+  r.state.failure('b','m',m.Failure('upstream_error'))
+  check('new failure invalidates a completed observation',not r.state.get('b')['reclaim_verified'] and r.state.get('b')['reclaim_after']==0)
   r.state.items['a']['reclaim_active_until']=10001
   r.state.failure('a','m',m.Failure('upstream_error'))
   check('failed observation reopens circuit and doubles delay',r.state.get('a')['state']=='open' and r.state.get('a')['reclaim_delay']==600)

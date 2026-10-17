@@ -1,6 +1,10 @@
 const routingReasons={internal_router_error:'路由器内部错误',quota_wait:'等待官方额度恢复',balance_wait:'来源余额待确认',auth_required:'需要重新授权',permission_denied:'此模型权限不足',model_unavailable:'此模型暂无渠道或该模型额度不可用',rate_limited:'上游限流',upstream_error:'上游临时错误',connection_failed:'连接失败',first_event_timeout:'等待有效事件超时',no_progress_timeout:'仅有握手或心跳，未开始生成',stream_idle_timeout:'生成过程中长时间无进展',stream_interrupted:'流式连接中断',invalid_response:'上游协议响应无效',empty_stream:'上游未完成响应',manual_paused:'手动暂停',half_open_busy:'正在验证恢复',success:'完成',invalid_request:'请求参数或上下文错误',client_cancelled:'客户端取消',budget_exhausted:'整条切换链等待超时',continuation_requires_full_history:'此续接需要完整历史',probe_timeout:'恢复探测超时'};
 function routingLabel(code){return routingReasons[code]||code||'就绪'}
+routingReasons.policy_rejected='上游内容或安全策略拒绝，请调整输入';
+routingReasons.access_denied='来源访问受限，原因或影响范围待确认';
 function routingTime(value){return value?new Date(value*1000).toLocaleString('zh-CN'):'待确认'}
+function quotaScheduleLabel(source,now=Date.now()/1000){const r=source.routing||{},q=source.quota||{};if(source.kind==='oauth')return r.next_check?(r.next_check>now?'下次额度检查 '+routingTime(r.next_check):'额度检查已到期，等待查询'):'';return q.checked_at?'最近余额查询 '+new Date(q.checked_at).toLocaleString('zh-CN')+(q.status==='unknown'?' · 查询结果未知':''):''}
+function reclaimObservationVisible(source,scope){return source.kind==='api'&&source.enabled&& !source.quota?.excluded&&(source.routing?.state||'closed')==='closed'&&!source.routing?.consecutive&&(scope.state||'closed')==='closed'&&!scope.consecutive&&!!scope.reclaim_after}
 routingReasons.reserve_wait='已达到官方额度预留线';
 routingReasons.reserve_unknown='官方剩余额度未知，已保护性跳过';
 const reservePanel=document.createElement('section');
@@ -12,19 +16,27 @@ $('reserve-form').addEventListener('input',()=>{$('reserve-form').dataset.dirty=
 $('reserve-form').onsubmit=async e=>{e.preventDefault();let form=e.currentTarget,percent=Number($('reserve-percent').value);if(!Number.isInteger(percent)||percent<1||percent>50){$('reserve-feedback').textContent='请输入 1 到 50 的整数百分比';return}form.dataset.saving='true';$('reserve-save').disabled=true;try{await post('official-reserve',{enabled:$('reserve-enabled').checked,percent});delete form.dataset.dirty;await refresh();$('reserve-feedback').textContent='设置已保存并应用'}catch(error){$('reserve-feedback').textContent=error.message}finally{delete form.dataset.saving;$('reserve-save').disabled=false}};
 updateReserveControls();
 function sourceDetails(s,open=false){
-  const r=s.routing||{},last=s.last_test,entries=Object.entries(s.model_routing||{});
-  let parts=[];
-  if(r.reserve_enabled)parts.push(`额度保护：预留 ${r.reserve_percent}%${r.reserve_blocked?'，已达预留线':''}`);
-  if(r.windows?.length)parts.push(r.windows.map(w=>escape((w.limit_window_seconds>=604800?'周窗口':w.limit_window_seconds===18000?'5 小时窗口':'额度窗口')+' 已用 '+w.used_percent+'%，恢复 '+routingTime(w.reset_at))).join('<br>'));
-  if(r.next_check)parts.push(r.next_check>Date.now()/1000?'下次额度检查 '+escape(routingTime(r.next_check)):'额度检查已到期，等待查询');
-  const schedule=probeSchedule(r);if(schedule)parts.push(escape(schedule));
-  if(s.kind==='api'&&r.reclaim_after)parts.push(r.reclaim_verified?'稳定观察已通过，可供满足保持时间的会话回迁':'恢复稳定观察中 · '+(r.reclaim_after>Date.now()/1000?'验证时间 '+escape(routingTime(r.reclaim_after)):'等待稳定性探测'));
-  function probeResult(v){return v.last_probe?`最近恢复探测：${v.last_probe.passed?'成功':'失败'} · ${escape(v.last_probe.model||'')}${v.last_probe.http?' · HTTP '+escape(v.last_probe.http):''} · ${escape(routingLabel(v.last_probe.reason))}${v.probe_finished_at?' · '+escape(routingTime(v.probe_finished_at)):''}`:v.probe_finished_at?'最近恢复探测：旧记录未保存结果 · '+escape(routingTime(v.probe_finished_at)):''}
-  if(probeResult(r))parts.push(probeResult(r));
-  if(r.query_error)parts.push('官方额度查询暂不可用 · '+escape(r.query_error));
-  entries.forEach(([m,v])=>parts.push(`<code>${escape(m)}</code> · ${escape(routingLabel(v.reason))}${probeSchedule(v)?' · '+escape(probeSchedule(v)):''}${probeResult(v)?'<br>'+probeResult(v):''}${s.kind==='api'&&v.reclaim_after?'<br>'+escape(v.reclaim_verified?'该模型稳定观察已通过':'该模型稳定观察中，验证时间 '+routingTime(v.reclaim_after)):''}`));
-  if(last)parts.push(`最近手动测试（不代表当前可用性）：${last.skipped||last.http===503&&last.error?.includes('等待恢复')?'未执行（规则拦截）':last.passed?'通过':'失败'} · ${escape(last.seconds)}s${last.http?' · HTTP '+escape(last.http):''}${last.checked_at?' · '+escape(new Date(last.checked_at).toLocaleString('zh-CN')):''}${!last.passed&&last.error?'<br>'+escape(last.error):''}`);
-  return parts.length?`<details class="source-details" data-source="${s.id}" ${open?'open':''}><summary>额度与历史${entries.length?' · '+entries.length+' 个模型异常':''}</summary><div>${parts.join('<br>')}</div></details>`:'';
+  const r=s.routing||{},q=s.quota||{},faults=Object.entries(s.model_routing||{}),recoveries=Object.entries(s.model_recovery||{}),last=s.last_test;
+  const historyOpen=[...$('sources').querySelectorAll('details.test-history[open]')].some(d=>d.dataset.history===s.id);
+  const row=(label,value)=>`<div class="detail-field"><dt>${escape(label)}</dt><dd>${escape(value)}</dd></div>`;
+  const section=(title,icon,body)=>`<section class="provider-section"><h3>${statusIcon(icon)}${escape(title)}</h3>${body}</section>`;
+  const phase=v=>{if(!s.enabled)return '已暂停';if(probeSchedule(v))return probeSchedule(v);if(v.reclaim_required)return '需要重新验证稳定性';if(reclaimObservationVisible(s,v))return v.reclaim_verified?'观察通过，回迁仍需满足模型和会话条件':v.reclaim_after>Date.now()/1000?'稳定观察至 '+routingTime(v.reclaim_after):'观察结束，等待额外验证';return ''};
+  const probe=v=>v.last_probe?`<dl>${row('最近探测',(v.last_probe.passed?'通过':'失败')+(v.last_probe.http?' · HTTP '+v.last_probe.http:''))}${row('探测模型',v.last_probe.model||'未知')}${row('探测时间',v.probe_finished_at?routingTime(v.probe_finished_at):'未知')}${!v.last_probe.passed?row('探测结果',routingLabel(v.last_probe.reason)):''}</dl>`:'';
+  let quota='';
+  if(s.kind==='oauth'){
+    quota+=`<dl>${row('额度预留',r.reserve_enabled?'预留 '+r.reserve_percent+'%':'未开启')}`;
+    for(const w of r.windows||[])quota+=row(w.limit_window_seconds>=604800?'周窗口':w.limit_window_seconds===18000?'5 小时窗口':'额度窗口','已用 '+w.used_percent+'% · 重置 '+routingTime(w.reset_at));
+    const schedule=quotaScheduleLabel(s);if(schedule)quota+=row('查询安排',schedule);
+    if(r.query_error)quota+=row('查询状态','查询异常，等待重试');quota+='</dl>';
+  }else quota=`<dl>${row('当前余额',balanceCny(q))}${row('查询状态',q.status==='available'?'正常':q.status==='exhausted'?'余额耗尽':'余额未知')}${row('最近查询',q.checked_at?new Date(q.checked_at).toLocaleString('zh-CN'):'尚未查询')}</dl>`;
+  let recovery='';
+  const sourceFault=(r.state||'closed')!=='closed'||r.consecutive>0||r.reclaim_required;
+  if(sourceFault||r.reclaim_after){recovery+=`<div class="recovery-item"><strong>来源状态</strong><dl>${row('影响范围',sourceFault?'来源暂不可用或待验证；所有模型受来源状态约束':'来源恢复观察')}${r.reason?row('原因',routingLabel(r.reason)):''}${phase(r)?row('恢复进度',phase(r)):''}</dl>${probe(r)}</div>`;}
+  for(const [name,v] of [...faults,...recoveries])recovery+=`<div class="recovery-item"><strong><code>${escape(name)}</code></strong><dl>${row('范围',faults.some(([m])=>m===name)?'仅此模型；其他模型按各自状态选路':'此模型已恢复，观察中')}${v.reason?row('原因',routingLabel(v.reason)):''}${phase(v)?row('恢复进度',phase(v)):''}</dl>${probe(v)}</div>`;
+  let content=section('额度信息','reserve',quota);
+  if(recovery)content+=section('故障与恢复','waiting',recovery);
+  if(last){const skipped=last.skipped||last.http===503&&last.error?.includes('等待恢复');content+=`<details class="test-history" data-history="${escape(s.id)}"${historyOpen?' open':''}><summary>${statusIcon('activity')}历史手动测试 · ${skipped?'未执行':last.passed?'通过':'失败'}</summary><p>历史记录，不代表当前可用性</p><dl>${row('测试模型',last.model||'未记录')}${row('测试时间',last.checked_at?new Date(last.checked_at).toLocaleString('zh-CN'):'未知')}${row('结果',skipped?'被准入规则拦截':last.passed?'通过':'失败')}${last.http?row('HTTP',last.http):''}${last.seconds!=null?row('耗时',last.seconds+' 秒'):''}${last.error?row('说明',last.error):''}</dl></details>`;}
+  return `<details class="source-details" data-source="${escape(s.id)}" ${open?'open':''}><summary>供应商详情${faults.length?' · '+faults.length+' 个模型异常':''}</summary><div class="provider-details">${content}</div></details>`;
 }
 $('sources').addEventListener('click',e=>{let b=e.target.closest('.recovery-check');if(b)act(async()=>{await post('recheck',{id:b.dataset.source});notice('已安排恢复检查；故障来源可能发送少量测试请求。')})});
 renderLogs=function(){let q=$('log-filter').value.trim().toLowerCase(),filter=$('log-status').value;let failed=r=>r.outcome?r.outcome!=='success':r.status_code>=400;let rows=logData.rows.filter(r=>(r.model+' '+r.source+' '+r.endpoint).toLowerCase().includes(q)&&(filter==='all'||(filter==='failed'?failed(r):!failed(r))));$('log-summary').textContent=logData.error?'日志采集异常：'+logData.error:`已保存 ${logData.total||0} 条 · 当前显示 ${rows.length} 条 · 每 4 秒刷新`;$('log-rows').innerHTML=rows.length?rows.map(r=>`<tr class="status-${failed(r)?'error':'healthy'}"><td>${escape(new Date(r.timestamp).toLocaleString('zh-CN'))}<small>${escape(r.method)} ${escape(r.endpoint)}</small></td><td><code>${escape(r.model||'—')}</code></td><td>${escape(r.source||'—')}${r.trace?.length&&(r.trace.length>1||failed(r)||r.attempts>1)?`<details><summary>${r.attempts} 次尝试 · 查看切换原因</summary>${r.trace.map(t=>`<div>${escape(t.source)} · ${t.action==='skip'?'跳过':'请求'} · ${escape(routingLabel(t.reason))}${t.seconds!=null?' · '+escape(t.seconds)+'s':''}</div>`).join('')}</details>`:r.attempts>1?'<small>'+r.attempts+' 次上游尝试</small>':''}</td><td><span class="log-result ${failed(r)?'is-error':'is-healthy'}">${statusIcon(failed(r)?'error':'healthy')}${failed(r)?'失败':'成功'}</span><small>HTTP ${escape(r.status_code||'—')}</small>${r.outcome&&r.outcome!=='success'?'<small>'+escape(routingLabel(r.outcome))+'</small>':''}</td><td>${r.latency_ms!=null?(r.latency_ms/1000).toFixed(2)+'s':'—'}</td><td>${escape(r.input_tokens??'—')} / ${escape(r.output_tokens??'—')}</td><td>${escape(r.cached_tokens??'—')} / ${escape(r.total_tokens??'—')}</td></tr>`).join(''):'<tr><td colspan="7" class="empty">暂无匹配请求</td></tr>'};

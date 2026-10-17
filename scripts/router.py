@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import secrets
 import sqlite3
 import time
@@ -23,6 +24,7 @@ from aiohttp import web
 DATA = Path(os.environ.get('ROUTER_DATA', '/app/private'))
 GATEWAY = os.environ.get('GATEWAY_URL', 'http://gateway:18317')
 TZ = datetime.timezone(datetime.timedelta(hours=8))
+MODEL_ERROR_IDLE_TTL = 3600
 
 
 def read(name, default=None):
@@ -80,36 +82,111 @@ class ProbeSink:
     async def write_eof(self): pass
 
 
-def classify(status, payload, headers=None, official=False):
-    """Never persist upstream messages: only these fixed classification codes."""
-    text = json.dumps(payload, ensure_ascii=False).lower()
-    error = payload.get('error', {}) if isinstance(payload, dict) else {}
-    error = error if isinstance(error, dict) else {}
-    if any(w in text for w in ('context_length_exceeded', 'context_window_exceeded', 'invalid_request_error')) and status == 400:
-        return Failure('invalid_request', 400)
-    if any(w in text for w in ('get_channel_failed', 'model_not_found', 'model_not_supported', '无可用渠道')):
-        return Failure('model_unavailable', status if status >= 400 else 503)
-    if any(w in text for w in ('usage_limit_reached', 'insufficient_quota', 'quota_exceeded', '余额不足')):
-        reset = error.get('resets_at') or error.get('reset_at') or 0
+STOP_FAILURES = {'invalid_request', 'policy_rejected', 'continuation_requires_full_history'}
+
+
+def error_token(value):
+    """Only bounded machine identifiers may enter persisted diagnostics."""
+    if not isinstance(value, str): return ''
+    value = value.strip().lower()
+    return value if re.fullmatch(r'[a-z][a-z0-9_.:-]{0,79}', value) else ''
+
+
+def classify(status, payload, headers=None, official=False, transport_status=None):
+    """Normalize structured errors before HTTP fallback; never save messages."""
+    chain = []
+    current = payload
+    for _ in range(4):
+        if not isinstance(current, dict): break
+        response = current.get('response')
+        if isinstance(response, dict) and isinstance(response.get('error'), dict): current = response
+        error = current.get('error')
+        if not isinstance(error, dict):
+            error = current if any(k in current for k in ('code', 'message')) else {}
+        chain.append(error)
+        message = error.get('message')
+        if not isinstance(message, str) or len(message) > 65536: break
+        candidates = [message.strip()]
+        candidates.extend(line.lstrip()[5:].strip() for line in message.splitlines() if line.lstrip().startswith('data:'))
+        nested = None
+        for candidate in candidates:
+            try: obj = json.loads(candidate)
+            except (ValueError, TypeError, RecursionError): continue
+            if isinstance(obj, dict) and (isinstance(obj.get('error'), dict) or
+                    (isinstance(obj.get('response'), dict) and isinstance(obj['response'].get('error'), dict))):
+                nested = obj; break
+        if nested is None: break
+        current = nested
+    error = chain[-1] if chain else {}
+    code, typ = error_token(error.get('code')), error_token(error.get('type'))
+    identifiers = {code, typ} - {''}
+    diagnostic = {'outer_http': status if transport_status is None else transport_status}
+    outer = chain[0] if chain else {}
+    for label, value in [('outer_code',outer.get('code')),('outer_type',outer.get('type')),
+                         ('code',error.get('code')),('type',error.get('type'))]:
+        if error_token(value): diagnostic[label] = error_token(value)
+    def result(kind, http, **kwargs):
+        failure = Failure(kind, http, **kwargs)
+        failure.diagnostic = diagnostic
+        return failure
+    # Explicit request/policy errors take precedence even over nested outages.
+    policy = {'cyber_policy','bio_policy','misalignment_policy_violation','prompt_blocked',
+              'sensitive_words_detected','content_policy_violation','content_filter','violation_fee.grok.csam'}
+    context = {'context_length_exceeded','context_window_exceeded','context_too_large'}
+    all_codes = {error_token(e.get(k)) for e in chain for k in ('code','type')}
+    if all_codes & policy: return result('policy_rejected', 400)
+    if all_codes & context: return result('invalid_request', 400)
+    if identifiers & {'previous_response_not_found','previous_response_id_not_found'}:
+        return result('continuation_requires_full_history', 409)
+    if identifiers & {'get_channel_failed','model_not_found','model_not_supported','model_not_available',
+                      'channel:no_available_key','channel:model_mapped_error','model_price_error'}:
+        return result('model_unavailable', 503)
+    quota = {'usage_limit_reached','insufficient_quota','quota_exceeded','insufficient_user_quota',
+             'pre_consume_token_quota_failed','credit_balance_exhausted',
+             'organization_spend_limit_exceeded','project_spend_limit_exceeded','usage_not_included'}
+    message = error.get('message') if isinstance(error.get('message'), str) else ''
+    # Compatibility only for unstructured legacy errors, not substring codes.
+    legacy = not code and typ in ('','invalid_request_error','new_api_error','permission_error')
+    if identifiers & quota or (legacy and '余额不足' in message):
+        reset = 0
         try:
-            reset = float(reset)
-            if not math.isfinite(reset): reset=0
-            if reset > 1e12: reset /= 1000
-        except (ValueError, TypeError): reset = 0
-        # Only the provider's dedicated balance endpoint is authoritative for
-        # balance. A relay's inference response is model-specific evidence.
-        return Failure('quota_wait' if official else 'model_unavailable', 429 if official else 403, reset=reset)
-    if status == 401:
-        return Failure('auth_required', 401)
-    if status == 403:
-        return Failure('permission_denied', 403)
-    if status == 404:
-        return Failure('model_unavailable', 404)
-    if status == 429:
-        return Failure('rate_limited', 429, delay=retry_after((headers or {}).get('Retry-After')))
-    if status in (400, 413, 422):
-        return Failure('invalid_request', status)
-    return Failure('upstream_error', status if status >= 400 else 502)
+            value = error.get('resets_at') or error.get('reset_at')
+            if value is not None and not isinstance(value, bool):
+                reset = float(value)
+                if reset > 1e12: reset /= 1000
+            elif not isinstance(error.get('resets_in_seconds'), bool):
+                seconds = float(error.get('resets_in_seconds',0))
+                if seconds > 0 and math.isfinite(seconds): reset = time.time()+seconds
+            if not math.isfinite(reset) or reset < 0: reset = 0
+        except (ValueError, TypeError, OverflowError): reset = 0
+        return result('quota_wait' if official else 'model_unavailable', 429 if official else 403, reset=reset)
+    retry_headers = error.get('headers') if isinstance(error.get('headers'), dict) else {}
+    delay = next((v for h in (headers or {},retry_headers) for k,v in h.items() if str(k).lower()=='retry-after'), None)
+    if identifiers & {'rate_limit_exceeded','rate_limit_error','slow_down','server_is_overloaded','service_unavailable_error'}:
+        return result('rate_limited', 429, delay=retry_after(delay))
+    if identifiers & {'invalid_api_key','authentication_error','unauthorized','token_expired','invalid_token'}:
+        return result('auth_required', 401)
+    if identifiers & {'permission_denied','permission_error','forbidden'}:
+        return result('permission_denied', 403)
+    if identifiers & {'access_denied','unsupported_country_region_territory','country_not_supported','region_not_supported'}:
+        return result('access_denied', 403)
+    if identifiers & {'upstream_unavailable','server_error','service_unavailable','internal_server_error',
+                      'upstream_error','do_request_failed','channel:response_time_exceeded','channel:invalid_key',
+                      'channel:param_override_invalid','channel:header_override_invalid','channel:aws_client_error',
+                      'gen_relay_info_failed','json_marshal_failed','bad_response','bad_response_body',
+                      'bad_response_status_code','empty_response','read_response_body_failed','aws_invoke_error',
+                      'query_data_error','update_data_error'}:
+        return result('upstream_error', status if status >= 500 else 502)
+    if legacy and '无可用渠道' in message: return result('model_unavailable', 503)
+    if identifiers & {'invalid_request','invalid_request_error','bad_request_error','invalid_prompt',
+                      'bad_request_body','read_request_body_failed','convert_request_failed','invalid_api_type'}:
+        return result('invalid_request', 400)
+    if status == 401: return result('auth_required', 401)
+    if status == 403: return result('access_denied', 403)
+    if status == 404: return result('model_unavailable', 404)
+    if status == 429: return result('rate_limited', 429, delay=retry_after(delay))
+    if status in (400,413,422): return result('invalid_request', status)
+    return result('upstream_error', status if status >= 400 else 502)
 
 
 class State:
@@ -118,14 +195,24 @@ class State:
         path = directory / 'routing-state.json'
         try: self.items = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError): self.items = {}
-        for item in self.items.values():
+        for key, item in self.items.items():
             item['probe_in_progress'] = False
+            if item.get('state')=='model_balance_wait':
+                item.update(state='open',reason='model_unavailable',until=0)
             # Repair stale cooldowns left by an earlier failed recovery probe.
             if item.get('state', 'closed') == 'closed' and item.get('until', 0):
                 if item.get('consecutive', 0) > 0:
                     item['state'] = 'open'
                 else:
                     item['until'] = 0
+            # Older state files predate business-request activity tracking.
+            # Use the last recorded failure/probe time only as a migration hint.
+            if '/' in key and not item.get('last_client_request_at'):
+                checked = item.get('checked_at')
+                item['last_client_request_at'] = time.time()
+                if isinstance(checked, str):
+                    try: item['last_client_request_at'] = datetime.datetime.fromisoformat(checked).timestamp()
+                    except (ValueError, TypeError): pass
         self.active = set()
         self.history = collections.defaultdict(lambda: collections.deque(maxlen=10))
 
@@ -141,10 +228,11 @@ class State:
     def get(self, key):
         return self.items.get(key, {})
 
-    def acquire(self, ident, model):
+    def acquire(self, ident, model, include_model=True):
         """Half-open permits are per scope and never shared with normal traffic."""
         permits = []
-        for key in (ident, self.key(ident, model)):
+        keys = (ident, self.key(ident, model)) if include_model else (ident,)
+        for key in keys:
             item = self.get(key)
             state = item.get('state', 'closed')
             if state in ('quota_wait', 'balance_wait', 'model_balance_wait', 'auth_required'):
@@ -163,6 +251,34 @@ class State:
     def release(self, permits):
         self.active.difference_update(permits or [])
 
+    def mark_client_request(self, ident, model):
+        """Record only a real downstream API attempt; probes/tests never call this."""
+        item = self.items.setdefault(self.key(ident, model), {})
+        item['last_client_request_at'] = time.time()
+        item['last_client_request_at_iso'] = stamp()
+        self.persist()
+
+    def expire_idle_model_errors(self, ttl=MODEL_ERROR_IDLE_TTL):
+        """Forget stale model-scoped errors after a quiet period.
+
+        This only removes model-scoped evidence. Source breakers, quota state,
+        and recovery probes remain untouched. A later business request can
+        establish the model error again if the upstream still rejects it.
+        """
+        now = time.time(); removed = []
+        model_reasons = {'model_unavailable', 'permission_denied', 'model_balance_wait'}
+        for key, item in list(self.items.items()):
+            if '/' not in key or item.get('reason') not in model_reasons: continue
+            if key in self.active or item.get('probe_in_progress'): continue
+            last = item.get('last_client_request_at')
+            if not isinstance(last, (int, float)) or isinstance(last, bool) or not math.isfinite(last): continue
+            if now - last < ttl: continue
+            removed.append(key)
+            del self.items[key]
+            self.history.pop(key, None)
+        if removed: self.persist()
+        return removed
+
     def success(self, ident, model, permits=(), versions=None):
         for key in (ident, self.key(ident, model)):
             item = self.items.setdefault(key, {})
@@ -172,27 +288,36 @@ class State:
             item['last_success_at'] = stamp()
             # A model success only clears its own scope; source recovery needs its permit.
             if item.get('state', 'closed') == 'closed':
+                if item.get('reclaim_required'):
+                    item.update(state='half_open', successes=1, until=time.time()+15, reason='')
+                    continue
                 item.update(reason='', until=0,retry_check_at=0)
                 continue
             if key not in permits: continue
             item['successes'] = item.get('successes', 0) + 1
             if item['successes'] >= 2:
                 item.update(state='closed', checked_at=stamp(), consecutive=0, reason='', until=0, level=0, successes=0,
-                            reclaim_after=time.time()+item.get('reclaim_delay',300), reclaim_verified=False)
+                            reclaim_after=time.time()+item.get('reclaim_delay',300), reclaim_verified=False, reclaim_required=False)
                 self.history[key].clear()
             else:
                 item.update(state='half_open', until=time.time() + 15, checked_at=stamp())
         self.persist()
 
     def failure(self, ident, model, failure):
-        if failure.kind in ('invalid_request', 'client_cancelled', 'budget_exhausted'): return
+        if failure.kind in STOP_FAILURES | {'client_cancelled', 'budget_exhausted'}: return
         model_scope = failure.kind in ('model_unavailable', 'permission_denied', 'model_balance_wait')
         key = self.key(ident, model if model_scope else '')
         item = self.items.setdefault(key, {})
+        # Probe-created faults also expire; later probes must not renew this anchor.
+        if model_scope: item.setdefault('last_client_request_at', time.time())
         item['revision']=item.get('revision',0)+1
         if (item.get('reclaim_after') and not item.get('reclaim_verified')) or item.get('reclaim_active_until',0)>time.time():
             item.update(state='open',reclaim_delay=min(1800,item.get('reclaim_delay',300)*2),reclaim_after=0,reclaim_verified=False)
         item['reclaim_active_until']=0
+        was_reclaim_qualified = bool(item.get('reclaim_after') or item.get('reclaim_verified'))
+        # A new failure invalidates every earlier observation for this scope.
+        item.update(reclaim_after=0, reclaim_verified=False)
+        if was_reclaim_qualified: item['reclaim_required']=True
         history = self.history[key]
         history.append(True)
         count = item.get('consecutive', 0) + 1
@@ -342,7 +467,7 @@ class Router:
                         scopes=[self.state.get(candidate['id']),self.state.get(self.state.key(candidate['id'],model))]
                         if not scopes[1].get('last_success_at'): continue
                         if any(v.get('state','closed')!='closed' or v.get('consecutive',0) or
-                               (v.get('reclaim_after') and (v['reclaim_after']>time.time() or not v.get('reclaim_verified'))) for v in scopes): continue
+                               (v.get('reclaim_after') and (v['reclaim_after']>time.time() or not v.get('reclaim_verified'))) or v.get('reclaim_required') for v in scopes): continue
                         if scopes[0].get('probe_model') and scopes[0]['probe_model']!=model and scopes[0].get('reclaim_after'): continue
                         reclaim_ids.add(candidate['id'])
                 sources.sort(key=lambda s: (0 if s['id'] in reclaim_ids else 1, s['id'] != affinity[0]))
@@ -419,6 +544,7 @@ class Router:
                     self.state.release(permits)
                     raise Failure('budget_exhausted', 504)
                 row.update(action='attempt', reason='in_progress')
+                self.state.mark_client_request(source['id'], model)
                 old=self.sessions.get(session) if session else None
                 ordered=[s['id'] for s in self.settings()['sources']]
                 if old and time.time()-old[1]<3600 and old[0]!=source['id'] and body['model']==model and not continuation and old[0] in ordered and ordered.index(source['id'])<ordered.index(old[0]):
@@ -437,17 +563,22 @@ class Router:
                     return result
                 except Failure as failure:
                     row.update(reason=failure.kind, seconds=round(time.monotonic() - tick, 2))
+                    if getattr(failure, 'diagnostic', None): row['upstream_error'] = failure.diagnostic
                     self.state.failure(source['id'], model, failure)
                     status, outcome = failure.status, failure.kind
                     if getattr(failure, 'committed', False):
                         # attempt has already sent an SSE error and closed the stream.
                         status = 200
                         return failure.response
-                    if continuation or failure.kind == 'invalid_request': break
+                    if continuation or failure.kind in STOP_FAILURES: break
                 finally:
                     self.state.release(permits)
             retry = min([max(1, int((v.get('until') or v.get('next_check') or 0) - time.time())) for k, v in self.state.items.items() if k.split('/')[0] in {s['id'] for s in sources} and (v.get('until') or v.get('next_check') or 0) > time.time()] or [60])
-            return web.json_response({'error': {'code': outcome, 'message': '可用来源均未完成请求；请查看控制面板的切换记录。', 'request_id': request_id, 'attempted': any(t['action']=='attempt' for t in trace)}}, status=status, headers={'Retry-After': str(retry)})
+            message = {'policy_rejected':'上游拒绝此请求：触发内容或安全策略，请调整输入。',
+                       'invalid_request':'上游拒绝请求参数或上下文，请调整后重试。',
+                       'continuation_requires_full_history':'上游续接状态不可用，请提供完整历史后重试。'}.get(outcome,
+                       '可用来源均未完成请求；请查看控制面板的切换记录。')
+            return web.json_response({'error': {'code': outcome, 'message': message, 'request_id': request_id, 'attempted': any(t['action']=='attempt' for t in trace)}}, status=status, headers={} if outcome in STOP_FAILURES else {'Retry-After': str(retry)})
         except asyncio.CancelledError:
             status, outcome = 499, 'client_cancelled'
             if trace and trace[-1].get('reason') == 'in_progress': trace[-1]['reason'] = outcome
@@ -492,9 +623,16 @@ class Router:
                     except TimeoutError: raise Failure('response_timeout', 504)
                     except ValueError: raise Failure('invalid_response', 502)
                     if not isinstance(obj, dict) or obj.get('error') or obj.get('status') in ('failed', 'incomplete'):
-                        raise classify(502, obj if isinstance(obj, dict) else {}, official=source['kind']=='oauth')
+                        raise classify(502, obj if isinstance(obj, dict) else {}, upstream.headers, official=source['kind']=='oauth', transport_status=upstream.status)
                     if downstream.path.endswith('/responses') and obj.get('status') != 'completed': raise Failure('invalid_response', 502)
-                    if downstream.path.endswith('/completions') and not obj.get('choices'): raise Failure('invalid_response', 502)
+                    if downstream.path.endswith('/completions'):
+                        choices=obj.get('choices')
+                        if not isinstance(choices,list) or not choices: raise Failure('invalid_response',502)
+                        for choice in choices:
+                            if not isinstance(choice,dict) or not isinstance(choice.get('message'),dict): raise Failure('invalid_response',502)
+                            message=choice['message']
+                            if message.get('content') is not None and not isinstance(message['content'],(str,list)): raise Failure('invalid_response',502)
+                            if message.get('tool_calls') is not None and not isinstance(message['tool_calls'],list): raise Failure('invalid_response',502)
                     return web.Response(body=raw, content_type='application/json'), obj.get('usage', {}), obj.get('id')
                 if 'text/event-stream' not in upstream.headers.get('Content-Type', ''):
                     raise Failure('invalid_response', 502)
@@ -531,14 +669,14 @@ class Router:
                         typ = obj.get('type', '')
                         if not isinstance(typ,str): raise Failure('invalid_response',502)
                         if typ in ('error', 'response.failed', 'response.incomplete') or obj.get('error'):
-                            raise classify(502, obj.get('response') or obj, official=source['kind'] == 'oauth')
+                            raise classify(502, obj.get('response') or obj, upstream.headers, official=source['kind'] == 'oauth', transport_status=upstream.status)
                         event_valid=typ.startswith('response.') if not downstream.path.endswith('/completions') else obj.get('object')=='chat.completion.chunk'
                         if not event_valid: raise Failure('invalid_response',502)
                         valid=True
                         resp = obj.get('response') or {}
                         if not isinstance(resp,dict): raise Failure('invalid_response',502)
                         if typ=='response.completed' and resp.get('status') in ('failed','incomplete'):
-                            raise classify(502,resp,official=source['kind']=='oauth')
+                            raise classify(502,resp,upstream.headers,official=source['kind']=='oauth',transport_status=upstream.status)
                         response_id = resp.get('id') or obj.get('id') or response_id
                         usage = resp.get('usage') or obj.get('usage') or usage
                         choices = obj.get('choices') or []
@@ -649,16 +787,20 @@ class Router:
             for key, item in list(self.state.items.items()):
                 observing=source['kind']=='api' and item.get('state','closed')=='closed' and item.get('reclaim_after',0)>0 and not item.get('reclaim_verified')
                 unconfirmed=item.get('state','closed')=='closed' and item.get('consecutive',0)>0 and item.get('retry_check_at',0)<=time.time()
-                if key.split('/')[0] != ident or (item.get('state') not in ('open', 'half_open') and not observing and not unconfirmed): continue
+                if key.split('/')[0] != ident or (item.get('state') not in ('open', 'half_open', 'model_balance_wait') and not observing and not unconfirmed): continue
                 if observing and item['reclaim_after']>time.time(): continue
                 if manual: item['until'] = 0
                 if item.get('until', 0) > time.time(): continue
-                model = self.default_probe_model(source) if item.get('reason') in ('model_balance_wait', 'balance_wait') else item.get('probe_model')
+                source_scope = '/' not in key
+                model = self.default_probe_model(source) if source_scope else key[len(ident)+1:]
                 if not model: continue
-                permits, _ = self.state.acquire(ident, model)
+                if source_scope: item['probe_model']=model
+                if item.get('state') == 'model_balance_wait': item.update(state='open', until=0)
+                permits, _ = self.state.acquire(ident, model, include_model=not source_scope)
                 if permits is None: continue
                 probing = [self.state.items[scope] for scope in permits] or [item]
                 versions={scope:self.state.get(scope).get('revision',0) for scope in (ident,self.state.key(ident,model))}
+                if source_scope: versions[self.state.key(ident,model)] = -1
                 for scope in probing:
                     scope.update(probe_in_progress=True, probe_started_at=time.time())
                 self.state.persist()
@@ -670,11 +812,17 @@ class Router:
                         result = await response.json()
                     for scope in probing:
                         scope['last_probe'] = {'passed':bool(result.get('ok')), 'reason':result.get('reason','success' if result.get('ok') else 'upstream_error'), 'http':result.get('status'), 'model':model}
+                        if result.get('diagnostic'): scope['last_probe']['upstream_error'] = result['diagnostic']
                     if result.get('ok'):
                         self.state.success(ident, model, permits, versions)
                         if observing and item.get('revision',0)==versions.get(key,0): item['reclaim_verified']=True
                         if unconfirmed and item.get('revision',0)==versions.get(key,0): item.update(state='half_open',successes=1,until=time.time()+15)
-                    else: self.state.failure(ident, model, Failure(result.get('reason', 'upstream_error'), result.get('status',502), delay=result.get('delay',0), reset=result.get('reset',0)))
+                    else:
+                        self.state.failure(ident, model, Failure(result.get('reason', 'upstream_error'), result.get('status',502), delay=result.get('delay',0), reset=result.get('reset',0)))
+                        # Model-only rejection cannot cure the source breaker or
+                        # cause a tight source-level probe loop.
+                        if source_scope and result.get('reason') in ('model_unavailable','permission_denied'):
+                            item.update(until=max(time.time()+30,self.state.get(self.state.key(ident,model)).get('until',0)),successes=0)
                 except (aiohttp.ClientError, TimeoutError, ValueError):
                     for scope in probing: scope['last_probe'] = {'passed':False,'reason':'probe_timeout','http':504,'model':model}
                     self.state.failure(ident, model, Failure('probe_timeout', 504))
@@ -720,13 +868,14 @@ class Router:
                 await self.attempt(request,body,source,model[len(source['id'])+1:],False,time.monotonic()+60,probe=True)
             return web.json_response({'ok':True,'status':200})
         except Failure as failure:
-            return web.json_response({'ok':False,'reason':failure.kind,'status':failure.status,'delay':failure.delay,'reset':failure.reset})
+            return web.json_response({'ok':False,'reason':failure.kind,'status':failure.status,'delay':failure.delay,'reset':failure.reset,'diagnostic':getattr(failure,'diagnostic',{})})
         except (aiohttp.ClientError,TimeoutError):
             return web.json_response({'ok':False,'reason':'probe_timeout','status':504})
 
     async def monitor(self):
         while True:
             now = time.time()
+            self.state.expire_idle_model_errors()
             for source in self.settings()['sources']:
                 ident = source['id']
                 self.apply_reserve(source)
